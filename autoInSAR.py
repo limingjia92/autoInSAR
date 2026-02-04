@@ -1234,6 +1234,14 @@ def main():
         
     args = parser.parse_args()
     
+    # timer start
+    start_time = time.time()
+    start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))
+    print("\n" + "#"*60)
+    print(f"[*] AutoInSAR Pipeline Started at: {start_str}")
+    print(f"[*] Execution Mode: Step='{args.step}'")
+    print("#"*60)
+    
     pipeline = AutoInSAR_Pipeline(args)
     
     if args.step == "search" or args.step == "all":
@@ -1256,6 +1264,19 @@ def main():
         
     if args.step == "post" or args.step == "all":
         pipeline.step_7_post_process()
+        
+    end_time = time.time()
+    end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))
+    duration = end_time - start_time
+    duration_str = str(timedelta(seconds=int(duration)))
+
+    # timer end
+    print("\n" + "#"*60)
+    print(f"[*] All Tasks Completed Successfully!")
+    print(f"[*] Start Time : {start_str}")
+    print(f"[*] End Time   : {end_str}")
+    print(f"[*] Total Time : {duration_str}")
+    print("#"*60 + "\n")
         
 if __name__ == "__main__":
     main()
