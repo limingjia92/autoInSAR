@@ -816,7 +816,6 @@ class AutoInSAR_Pipeline:
 
         print(f"[*] Reading results from: {merged_dir}")
         print(f"[*] Saving GRD outputs to: {result_dir}")
-        print(f"[*] Saving Plots to     : {plot_dir}")
         
         # extract orbit number
         orbit_num = "UNKNOWN"
