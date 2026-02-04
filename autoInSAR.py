@@ -612,7 +612,7 @@ class AutoInSAR_Pipeline:
     # --------------------------------------------------------------------------
     # Step 5: XML Generation 
     # --------------------------------------------------------------------------
-def step_5_generate_xml(self):
+    def step_5_generate_xml(self):
         print("\n" + "="*50)
         print(">>> Step 5: Generating ISCE XML Files")
         print("="*50)
