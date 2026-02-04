@@ -109,13 +109,17 @@ class AutoInSAR_Pipeline:
         self.slc_file_list = None
         self.slc_url_list = None
 
-    def run_command(self, cmd):
+    def run_command(self, cmd, quiet=False):
         """Generic command executor."""
-        print(f"\n[Exec]: {cmd}")
+        if not quiet:
+            print(f"\n[Exec]: {cmd}")
+        
         try:
-            subprocess.run(cmd, shell=True, check=True)
+            out_stream = subprocess.DEVNULL if quiet else None
+            
+            subprocess.run(cmd, shell=True, check=True, stdout=out_stream, stderr=out_stream)
         except subprocess.CalledProcessError:
-            print(f"Error executing command: {cmd}")
+            print(f"[!] Error executing command: {cmd}")
             sys.exit(1)
 
     # --------------------------------------------------------------------------
@@ -600,7 +604,7 @@ class AutoInSAR_Pipeline:
         cwd = os.getcwd()
         try:
             os.chdir(dem_dir)
-            self.run_command(cmd_stitch)
+            self.run_command(cmd_stitch, quiet=True)
         except Exception as e:
             print(f"[!] Error during DEM stitching: {e}")
             sys.exit(1)
@@ -771,7 +775,7 @@ class AutoInSAR_Pipeline:
             
             # The standard full InSAR processing command
             cmd = "topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'"
-            self.run_command(cmd)
+            self.run_command(cmd, quiet=True)
             
         except KeyboardInterrupt:
             print("\n[!] Process interrupted by user.")
