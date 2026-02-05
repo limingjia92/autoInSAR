@@ -8,7 +8,7 @@ It serves as a high-level wrapper around the **ISCE2** (InSAR Scientific Computi
 
 ## 1. Features
 
-The pipeline automates the following 7 steps:
+The pipeline automates the following 8 steps:
 
 1.  **Search**: Auto-query SLC images from ASF API based on an event date (Earthquake mode) or specific dates.
 2.  **Download**: Sequential downloading of SLC data with integrity verification.
@@ -17,6 +17,7 @@ The pipeline automates the following 7 steps:
 5.  **Config**: Auto-generation of ISCE XML configuration files (`tops.xml`, etc.).
 6.  **Process**: Execution of the standard `topsApp.py` workflow (startup -> geocodeoffsets).
 7.  **Post-Processing**: Result extraction, cropping, E/N/U decomposition, and Plotting.
+8.  **Cleanup**: (Optional) Intelligent removal of bulky raw data and intermediate ISCE products, retaining only final results.
 
 ## 2. Prerequisites
 
