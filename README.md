@@ -74,7 +74,7 @@ If multiple satellite tracks cover your area, specify the relative orbit number 
 ### Running Specific Steps
 You can run the pipeline step-by-step using the `--step` argument. Useful for debugging or re-running parts of the workflow.
 
-**Options:** `search`, `download`, `orbit`, `dem`, `xml`, `isce`, `post`, `all` (default).
+**Options:** `search`, `download`, `orbit`, `dem`, `xml`, `isce`, `post`, `all` (default), `clean`.
 
     # Example: Only run post-processing (result extraction & plotting)
     python autoInSAR.py --step post
