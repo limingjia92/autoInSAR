@@ -14,6 +14,7 @@ Description:
     5. Config   : Auto-generation of standard ISCE XML configuration files (tops.xml, reference.xml, secondary.xml).
     6. Process  : Execution of the standard topsApp.py workflow (startup -> geocodeoffsets).
     7. Post-Proc: Python-based result extraction, cropping, decomposition (E/N/U), and visualization (Matplotlib).
+    8. Cleanup  : (Optional) Automated deletion of raw inputs (SLC/DEM/Orbit) and intermediate files to save disk space.
 
 Dependencies:
     - System: ISCE2 (v2.6+), wget
@@ -65,6 +66,7 @@ import zipfile
 import glob
 import math
 import time
+import fnmatch
 from datetime import datetime, timedelta
 
 # for post processing
@@ -761,10 +763,8 @@ class AutoInSAR_Pipeline:
         if not os.path.exists(process_dir):
             sys.exit("[!] Error: 'process' directory not found. Please run Step 5 first.")
 
-        # Timer
-        start_time = time.time()
-        start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))
-        print(f"[*] Processing started at: {start_str}")
+        # print
+        print("[*] Processing started")
         print(f"[*] Switching to directory: {process_dir}")
         print("[*] Executing: topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'")
         print("    (This may take several hours depending on your hardware...)")
@@ -785,22 +785,8 @@ class AutoInSAR_Pipeline:
             sys.exit(1)
         finally:
             os.chdir(cwd)
-
-        # Stop Timer
-        end_time = time.time()
-        end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))
-        duration = end_time - start_time
         
-        # Format duration
-        duration_str = str(timedelta(seconds=int(duration)))
-        
-        print("-" * 50)
-        print(f"[*] Step 6 ISCE finished, files generated in: {process_dir}")
-        print(f"    - Start Time: {start_str}")
-        print(f"    - End Time  : {end_str}")
-        print(f"    - Duration  : {duration_str}")
-        print("-" * 50)
-        
+        print(f"[*] Step 6 ISCE finished, files generated in: {process_dir}")        
 
     # --------------------------------------------------------------------------
     # Step 7: Post Processing 
@@ -1005,6 +991,100 @@ class AutoInSAR_Pipeline:
         plt.close()
         
         print(f"[*] Step 7 Post-processing finished, results generated in '{result_dir}'")
+    
+    # --------------------------------------------------------------------------
+    # Step 8: Cleanup (Optional)
+    # --------------------------------------------------------------------------
+    def step_8_cleanup(self):
+        print("\n" + "="*50)
+        print(">>> Step 8: Cleaning Up Intermediate Files")
+        print("="*50)
+        
+        # Safety Check
+        print("[!] WARNING: This will DELETE source data (SLC, DEM, Orbits) and intermediate directories.")
+        print("    'results/', 'process/merged/', and XML/log files in 'process/' will be KEPT.")
+        
+        # Clean Top-level Directories (SLC, DEM, orbits)
+        targets = ["SLC", "DEM", "orbits"]
+        for t in targets:
+            dpath = os.path.join(self.work_dir, t)
+            if os.path.exists(dpath):
+                print(f"[*] Deleting directory: {t}/ ...")
+                shutil.rmtree(dpath, ignore_errors=True)
+            else:
+                print(f"    - {t}/ already removed or not found.")
+
+        # Clean 'process' directory (Keep 'merged' folder AND all files)
+        process_dir = os.path.join(self.work_dir, "process")
+        merged_dir = os.path.join(process_dir, "merged")
+        
+        if os.path.exists(process_dir):
+            print(f"[*] Cleaning 'process/' directory (Deleting sub-directories only, keeping files)...")
+            for item in os.listdir(process_dir):
+                item_path = os.path.join(process_dir, item)
+                
+                if item == "merged":
+                    continue
+                
+                try:
+                    if os.path.isdir(item_path) and not os.path.islink(item_path):
+                        shutil.rmtree(item_path)
+                except Exception as e:
+                    print(f"    [!] Failed to delete {item}: {e}")
+        else:
+            print("[!] 'process/' directory not found.")
+
+        # Clean 'process/merged' (Keep specific patterns)
+        if os.path.exists(merged_dir):
+            print(f"[*] Cleaning 'process/merged/' (applying retention filter)...")
+            
+            # Whitelist patterns
+            keep_patterns = [
+                "azimuth_angle_*_cut.grd",
+                "azimuth_offset_*_cut.grd",
+                "coherence_*_cut.grd",
+                "look_angle_*_cut.grd",
+                "los_*_cut.grd",
+                "range_offset_*_cut.grd",
+                "snr_*_cut.int",
+                "wrap_*_cut.int",
+                "filt_topophase.unw.geo*",
+                "filt_topophase.flat*",
+                "phsig.cor.geo*",
+                "los.rdr.geo*",
+                "filt_dense_offsets.bil*",
+                "dense_offsets_snr.bil.geo*"
+            ]
+            
+            deleted_count = 0
+            kept_count = 0
+            
+            for fname in os.listdir(merged_dir):
+                file_path = os.path.join(merged_dir, fname)
+                
+                should_keep = False
+                for pattern in keep_patterns:
+                    if fnmatch.fnmatch(fname, pattern):
+                        should_keep = True
+                        break
+                
+                if should_keep:
+                    kept_count += 1
+                else:
+                    try:
+                        if os.path.isfile(file_path) or os.path.islink(file_path):
+                            os.unlink(file_path)
+                            deleted_count += 1
+                        elif os.path.isdir(file_path):
+                            shutil.rmtree(file_path)
+                            deleted_count += 1
+                    except Exception as e:
+                        print(f"    [!] Failed to delete {fname}: {e}")
+
+            print(f"    - Deleted: {deleted_count} files")
+            print(f"    - Kept   : {kept_count} files")
+
+        print("[*] Step 8 Cleanup completed.")
     
     # --------------------------------------------------------------------------
     # Helper Methods
@@ -1228,7 +1308,7 @@ def main():
     
     # Steps
     parser.add_argument("--step", type=str, default="all",
-                        choices=["search", "download", "orbit", "dem", "xml", "isce", "post", "all"],
+                        choices=["search", "download", "orbit", "dem", "xml", "isce", "post", "clean", "all"],
                         help="Execution step")
 
     if len(sys.argv) == 1:
@@ -1267,6 +1347,9 @@ def main():
         
     if args.step == "post" or args.step == "all":
         pipeline.step_7_post_process()
+        
+    if args.step == "clean":
+        pipeline.step_8_cleanup()
         
     end_time = time.time()
     end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))
