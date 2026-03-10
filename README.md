@@ -1,5 +1,8 @@
 # autoInSAR: Automated Sentinel-1 InSAR Processing Pipeline
 
+[![Status](https://img.shields.io/badge/Status-Active-brightgreen)](https://github.com/limingjia92/StaMPS-HPC)
+[![License](https://img.shields.io/badge/License-GPL--v3.0-blue)](LICENSE)
+
 -----------------------------------------------------------------------
 
 **autoInSAR** is a fully automated Differential InSAR (D-InSAR) processing pipeline designed for **Sentinel-1** data. 
