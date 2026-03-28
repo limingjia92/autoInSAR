@@ -1,43 +1,62 @@
 #!/usr/bin/env python3
 """
-autoInSAR: Automated Sentinel-1 InSAR Processing Pipeline based on ISCE2
+autoInSAR: Automated Sentinel-1 InSAR Dual-Mode Processing Pipeline
 -----------------------------------------------------------------------
 
 Description:
-    This script provides a fully automated workflow for D-InSAR processing using Sentinel-1 data.
-    It wraps the ISCE2 (topsApp.py) software and handles the entire lifecycle of interferometry:
+    This script provides a fully automated, dual-track workflow for Sentinel-1 InSAR processing.
+    It serves as a high-level wrapper around the ISCE2 software ecosystem, automatically 
+    handling the entire lifecycle of data preparation and interferometry.
+
+    It operates in two distinct modes controlled by the '--mode' argument:
     
-    1. Search   : Auto-search SLCs from ASF API based on Event Date (Earthquake mode) or Manual Dates.
-    2. Download : Automated sequential downloading of SLCs and verification.
-    3. Orbit    : Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files with robust time-window matching.
+    [Mode A] 'pair' (Default) - D-InSAR Mode:
+        Designed for co-seismic or single-pair deformation analysis. Wraps `topsApp.py` 
+        to generate final unwrapped phase, Line-of-Sight (LOS) displacement, and 2D plots.
+        
+    [Mode B] 'stack' - Time-Series Mode:
+        Designed as the official upstream data feeder for the **StaMPS-HPC** framework. 
+        Wraps `stackSentinel.py` to prepare massive, perfectly coregistered SLC stacks, 
+        evaluates the spatiotemporal baseline network, and auto-recommends StaMPS modes.
+
+Pipeline Steps (Dual-Track Logic):
+    1. Search   : Auto-query ASF API. 
+                  - pair: Requires 2 dates (via --event_date or manual dates).
+                  - stack: Requires a date range (--start_date to --end_date) and strict --rel_orbit.
+    2. Download : Automated sequential downloading of SLCs and ZIP integrity verification.
+    3. Orbit    : Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files.
     4. DEM      : Auto-download SRTMGL1 tiles and stitch them using ISCE's dem utilities.
-    5. Config   : Auto-generation of standard ISCE XML configuration files (tops.xml, reference.xml, secondary.xml).
-    6. Process  : Execution of the standard topsApp.py workflow (startup -> geocodeoffsets).
-    7. Post-Proc: Python-based result extraction, cropping, decomposition (E/N/U), and visualization (Matplotlib).
-    8. Cleanup  : (Optional) Automated deletion of raw inputs (SLC/DEM/Orbit) and intermediate files to save disk space.
+    5. Config   : - pair: Auto-generates standard XMLs (tops.xml, reference.xml).
+                  - stack: Calls `stackSentinel.py` to map the network and generate `run_*` scripts.
+    6. Process  : - pair: Executes the standard `topsApp.py` workflow.
+                  - stack: Sequentially and safely executes the generated `run_01` to `run_13` scripts.
+    7. Post-Proc: - pair: GDAL extraction, E/N/U decomposition, and Matplotlib 2D visualization.
+                  - stack: Parses baseline grids, plots spatiotemporal network, and recommends PS/SBAS.
+    8. Cleanup  : - pair: Deletes raw inputs; keeps filtered result grids and intermediate logs.
+                  - stack: Extreme cleanup; retains ONLY `process/merged/` to save massive disk space.
 
 Dependencies:
     - System: ISCE2 (v2.6+), wget
     - Python: numpy, matplotlib, osgeo (gdal), requests
 
 Usage Examples:
-    1. Earthquake Mode (Auto-search +/- 12 days):
-       $ python autoInSAR.py --lon 40.7 --lat 13.6 --event_date 20251117 --platform S1A
+    [Pair Mode] 1. Earthquake / Event (Auto-search +/- 12 days):
+        $ python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --event_date 20251117 --platform S1A
 
-    2. Manual Pair Mode (Specific dates):
-       $ python autoInSAR.py --lon 40.7 --lat 13.6 --reference_date 20251113 --secondary_date 20251125
+    [Pair Mode] 2. Manual Dates:
+        $ python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --reference_date 20251113 --secondary_date 20251125
 
-    3. Specify Relative Orbit (e.g., Track 14):
-       $ python autoInSAR.py ... --rel_orbit 14
+    [Stack Mode] 3. Time-Series Preparation for StaMPS-HPC (Requires Relative Orbit):
+        $ python autoInSAR.py --mode stack --lon 40.7 --lat 13.6 --start_date 20200101 --end_date 20231231 --rel_orbit 14
 
-    4. Run specific step (e.g., Post-processing only):
-       $ python autoInSAR.py --step post
+    [General] 4. Run a specific step only (e.g., Cleanup):
+        $ python autoInSAR.py --mode stack --step clean
 
 Author:
     Mingjia Li
 
 Date:
-    February 2026
+    March 2026
 
 License:
     MIT License
@@ -87,10 +106,19 @@ class AutoInSAR_Pipeline:
         self.work_dir = os.getcwd()
         self.api_url = "https://api.daac.asf.alaska.edu/services/search/param"
         
-        # Initialize basic variables
+        # Initialize basic variables (Updated for dual-mode)
+        self.mode = args.mode
+        
+        # Dates for Pair Mode
         self.eq_date = args.event_date
         self.reference_date = args.reference_date
         self.secondary_date = args.secondary_date
+        
+        # Dates for Stack Mode
+        self.start_date = args.start_date
+        self.end_date = args.end_date
+        
+        # Spatial parameters
         self.lat = args.lat
         self.lon = args.lon
         
@@ -118,13 +146,12 @@ class AutoInSAR_Pipeline:
         
         try:
             out_stream = subprocess.DEVNULL if quiet else None
-            
             subprocess.run(cmd, shell=True, check=True, stdout=out_stream, stderr=out_stream)
         except subprocess.CalledProcessError:
             print(f"[!] Error executing command: {cmd}")
             sys.exit(1)
 
-    # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
     # Step 1: SLC Data Search
     # --------------------------------------------------------------------------
     def step_1_search_data(self):
@@ -132,7 +159,6 @@ class AutoInSAR_Pipeline:
         print(">>> Step 1: Searching SLC Data from ASF")
         print("="*50)
 
-        
         d = self.args.dlonlat
         min_lon = self.lon - d
         min_lat = self.lat - d
@@ -143,49 +169,68 @@ class AutoInSAR_Pipeline:
 
         query_time_ranges = []
 
-        if self.reference_date and self.secondary_date:
-            # Mode A: Specific Pair Mode (Search exact dates only)
+        # ==========================================
+        # Build Query Time Ranges based on Mode
+        # ==========================================
+        if self.mode == 'pair':
+            if self.reference_date and self.secondary_date:
+                # Mode A: Specific Pair Mode (Search exact dates only)
+                try:
+                    dt_s = datetime.strptime(self.reference_date, "%Y%m%d")
+                    dt_e = datetime.strptime(self.secondary_date, "%Y%m%d")
+                except ValueError:
+                    print("[!] Error: Date format must be YYYYMMDD")
+                    sys.exit(1)
+                
+                print(f"[*] Date Mode: Manual Pair Selection")
+                print(f"    - Date 1: {dt_s.date()}")
+                print(f"    - Date 2: {dt_e.date()}")
+
+                q1_start = dt_s.strftime("%Y-%m-%dT00:00:00.000Z")
+                q1_end = (dt_s + timedelta(hours=23, minutes=59, seconds=59)).strftime("%Y-%m-%dT23:59:59.999Z")
+                query_time_ranges.append((q1_start, q1_end))
+
+                q2_start = dt_e.strftime("%Y-%m-%dT00:00:00.000Z")
+                q2_end = (dt_e + timedelta(hours=23, minutes=59, seconds=59)).strftime("%Y-%m-%dT23:59:59.999Z")
+                query_time_ranges.append((q2_start, q2_end))
+
+            elif self.eq_date:
+                # Mode B: Event Mode (Auto range +/- 12 days)
+                try:
+                    eq_dt = datetime.strptime(self.eq_date, "%Y%m%d")
+                except ValueError:
+                    print("[!] Error: Date format must be YYYYMMDD")
+                    sys.exit(1)
+                
+                dt_start = eq_dt - timedelta(days=12)
+                dt_end = eq_dt + timedelta(days=12)
+                
+                t_start = dt_start.strftime("%Y-%m-%dT00:00:00.000Z")
+                t_end = dt_end.strftime("%Y-%m-%dT23:59:59.999Z")
+                
+                print(f"[*] Date Mode: Earthquake Event ({eq_dt.date()}) -> Auto Range: {dt_start.date()} to {dt_end.date()}")
+                query_time_ranges.append((t_start, t_end))
+                
+        elif self.mode == 'stack':
+            # Mode C: Time-Series Stack Mode
             try:
-                dt_s = datetime.strptime(self.reference_date, "%Y%m%d")
-                dt_e = datetime.strptime(self.secondary_date, "%Y%m%d")
+                dt_start = datetime.strptime(self.start_date, "%Y%m%d")
+                dt_end = datetime.strptime(self.end_date, "%Y%m%d")
             except ValueError:
                 print("[!] Error: Date format must be YYYYMMDD")
                 sys.exit(1)
-            
-            print(f"[*] Date Mode: Manual Pair Selection")
-            print(f"    - Date 1: {dt_s.date()}")
-            print(f"    - Date 2: {dt_e.date()}")
-
-            q1_start = dt_s.strftime("%Y-%m-%dT00:00:00.000Z")
-            q1_end = (dt_s + timedelta(hours=23, minutes=59, seconds=59)).strftime("%Y-%m-%dT23:59:59.999Z")
-            query_time_ranges.append((q1_start, q1_end))
-
-            q2_start = dt_e.strftime("%Y-%m-%dT00:00:00.000Z")
-            q2_end = (dt_e + timedelta(hours=23, minutes=59, seconds=59)).strftime("%Y-%m-%dT23:59:59.999Z")
-            query_time_ranges.append((q2_start, q2_end))
-
-        elif self.eq_date:
-            # Mode B: Event Mode (Auto range +/- 12 days)
-            try:
-                eq_dt = datetime.strptime(self.eq_date, "%Y%m%d")
-            except ValueError:
-                print("[!] Error: Date format must be YYYYMMDD")
-                sys.exit(1)
-            
-            dt_start = eq_dt - timedelta(days=12)
-            dt_end = eq_dt + timedelta(days=12)
-            
+                
             t_start = dt_start.strftime("%Y-%m-%dT00:00:00.000Z")
-            t_end = dt_end.strftime("%Y-%m-%dT23:59:59.999Z")
+            t_end = (dt_end + timedelta(hours=23, minutes=59, seconds=59)).strftime("%Y-%m-%dT23:59:59.999Z")
             
-            print(f"[*] Date Mode: Earthquake Event ({eq_dt.date()}) -> Auto Range: {dt_start.date()} to {dt_end.date()}")
+            print(f"[*] Date Mode: Time-Series Stack")
+            print(f"    - Start Date: {dt_start.date()}")
+            print(f"    - End Date  : {dt_end.date()}")
             query_time_ranges.append((t_start, t_end))
-        
-        else:
-            print("[!] Error: Missing date arguments. Use --event_date OR --reference_date/--secondary_date.")
-            sys.exit(1)
 
+        # ==========================================
         # Execute Queries
+        # ==========================================
         all_results = []
         print(f"[*] Querying ASF API ({len(query_time_ranges)} request(s))...")
         
@@ -198,14 +243,14 @@ class AutoInSAR_Pipeline:
                 "end": t_end,
                 "bbox": bbox,
                 "output": "json",
-                "maxResults": 200
+                "maxResults": 1000  # Increased for stack mode
             }
             if self.rel_orbit:
                 params["relativeOrbit"] = self.rel_orbit
 
             try:
                 if len(query_time_ranges) > 1:
-                    print(f"    Running query {idx+1}/{len(query_time_ranges)} for range {t_start[:10]}...")
+                     print(f"    Running query {idx+1}/{len(query_time_ranges)} for range {t_start[:10]}...")
                 
                 response = requests.get(self.api_url, params=params, timeout=60)
                 response.raise_for_status()
@@ -237,7 +282,9 @@ class AutoInSAR_Pipeline:
 
         print(f"[*] Found {len(results_list)} scenes total (merged).")
 
-        # Orbit Analysis
+        # ==========================================
+        # Orbit Analysis (Strict Single-Orbit check)
+        # ==========================================
         orbit_map = {} 
         for item in results_list:
             if 'relativeOrbit' in item:
@@ -256,45 +303,54 @@ class AutoInSAR_Pipeline:
             self.target_orbit = self.rel_orbit
             final_results = [x for x in results_list if int(x.get('relativeOrbit', -1)) == self.target_orbit]
         else:
-            if len(found_orbits) == 1:
+             if len(found_orbits) == 1:
                 self.target_orbit = found_orbits[0]
                 direction = orbit_map[self.target_orbit]
                 print(f"[*] Single orbit detected: {self.target_orbit} ({direction}). Proceeding automatically.")
                 final_results = results_list
-            else:
-                print(f"[!] Multiple orbits found: {found_orbits}")
-                print("    Please analyze which orbit fits best and run again with --rel_orbit <number>")
+             else:
+                print(f"\n[!] ERROR: Multiple overlapping orbits found: {found_orbits}")
+                print("    InSAR processing (both Pair and Stack modes) MUST be conducted on a SINGLE relative orbit.")
+                print("    Please analyze which orbit fits your study area best and run again with --rel_orbit <number>")
                 for orb in found_orbits:
                     cnt = sum(1 for x in results_list if int(x.get('relativeOrbit', -1)) == orb)
                     direction = orbit_map.get(orb, 'UNKNOWN')
-                    print(f"    Orbit {orb} ({direction}): {cnt} scenes")
+                    print(f"    - Orbit {orb} ({direction}): {cnt} scenes")
                 
-                print("[!] Stopping process. Please specify an orbit.")
+                print("\n[!] Stopping process. Please explicitly specify an orbit.")
                 sys.exit(0)
         
-        # dates number check
+        # ==========================================
+        # Dates Verification & Mode Enforcement
+        # ==========================================
         unique_dates = sorted(list(set([item.get('startTime', 'Unknown')[:10] for item in final_results])))
         
-        if len(unique_dates) > 2:
-            print("\n" + "!"*60)
-            print(f"[!] AMBIGUITY ERROR: Found {len(unique_dates)} unique dates in the search window.")
-            print(f"    Dates Found: {', '.join(unique_dates)}")
-            print("-" * 60)
-            print("    Standard InSAR processing requires exactly ONE pair (2 dates).")
-            print("    Your search (likely --event_date mode) captured too many revisit cycles.")
-            print("\n    >>> SOLUTIONS:")
-            print("    1. Use --platform (e.g., S1A) to filter if S1A/S1B/S1C are mixed.")
-            print(f"    2. Use manual pair selection instead of event mode:")
-            print(f"       python run_insar_auto.py ... --reference_date {unique_dates[0].replace('-','')} --secondary_date {unique_dates[1].replace('-','')}")
-            print("!"*60 + "\n")
+        if self.mode == 'pair':
+            if len(unique_dates) > 2:
+                print("\n" + "!"*60)
+                print(f"[!] AMBIGUITY ERROR: Found {len(unique_dates)} unique dates in the search window.")
+                print(f"    Dates Found: {', '.join(unique_dates)}")
+                print("-" * 60)
+                print("    Standard D-InSAR ('pair' mode) requires exactly ONE pair (2 dates).")
+                print("    Your search captured too many revisit cycles.")
+                print("\n    >>> SOLUTIONS:")
+                print("    1. Use manual pair selection (--reference_date / --secondary_date)")
+                print("    2. If you intend to do Time-Series, switch to --mode stack")
+                print("!"*60 + "\n")
+                sys.exit(0)
             
-            sys.exit(0)
-        
-        if len(unique_dates) < 2:
-            print(f"[!] Error: Found only {len(unique_dates)} date ({unique_dates}). InSAR requires a pair.")
-            sys.exit(0)
+            if len(unique_dates) < 2:
+                print(f"[!] Error: Found only {len(unique_dates)} date ({unique_dates}). InSAR requires a pair.")
+                sys.exit(0)
+                
+        elif self.mode == 'stack':
+            if len(unique_dates) < 2:
+                print(f"[!] Error: Found only {len(unique_dates)} date ({unique_dates}). Stack mode requires at least 2 dates.")
+                sys.exit(0)
 
+        # ==========================================
         # Save Results
+        # ==========================================
         final_results.sort(key=lambda x: x['processingDate'])
         
         list_filename = f"list_{self.platform}_{self.target_orbit}.txt"
@@ -302,7 +358,7 @@ class AutoInSAR_Pipeline:
         
         total_size = 0.0
         with open(list_filename, "w") as f_list, open(url_filename, "w") as f_url:
-            for item in final_results:
+             for item in final_results:
                 f_list.write(f"{item['fileName']}\n")
                 f_url.write(f"{item['downloadUrl']}\n")
                 total_size += float(item.get('sizeMB', 0))
@@ -337,13 +393,17 @@ class AutoInSAR_Pipeline:
         # Acquire SLC dates
         acquired_dates = [item.get('startTime', 'Unknown')[:10] for item in final_results]
         acquired_dates.sort()
+        
+        # De-duplicate for clean display
+        display_dates = sorted(list(set(acquired_dates)))
 
         target_dir = orbit_map.get(self.target_orbit, 'UNKNOWN')
-        print(f"[*] Search complete.")
+        print(f"\n[*] Search complete for {self.mode.upper()} mode.")
         print(f"    - Target Orbit: {self.target_orbit} ({target_dir})")
-        print(f"    - Scenes: {len(final_results)}")
-        print(f"    - Dates : {', '.join(acquired_dates)}")
-        print(f"    - Total Size: {total_size/1000:.2f} GB")
+        print(f"    - Total Scenes: {len(final_results)}")
+        print(f"    - Unique Dates: {len(display_dates)}")
+        print(f"    - Date List   : {', '.join(display_dates)}")
+        print(f"    - Total Size  : {total_size/1000:.2f} GB")
         print(f"    - File List saved to: {list_filename}")
         print(f"    - URL List saved to: {url_filename}")
         print(f"    - Extent File saved to: {extent_filename}")
@@ -616,108 +676,109 @@ class AutoInSAR_Pipeline:
         print(f"[*] Step 4 Dem completed, files saved in: {dem_dir}")
 
     # --------------------------------------------------------------------------
-    # Step 5: XML Generation 
+    # Step 5: Config / Script Generation
     # --------------------------------------------------------------------------
     def step_5_generate_xml(self):
         print("\n" + "="*50)
-        print(">>> Step 5: Generating ISCE XML Files")
+        if self.mode == 'pair':
+            print(">>> Step 5: Generating ISCE XML Files (Pair Mode)")
+        else:
+            print(">>> Step 5: Generating Run Scripts (Stack Mode)")
         print("="*50)
 
         process_dir = os.path.join(self.work_dir, "process")
         os.makedirs(process_dir, exist_ok=True)
 
-        # Ensure list file 
-        if not self.slc_file_list:
-            self.slc_file_list = self._auto_detect_list_file()
-            
-            if self.slc_file_list:
-                print(f"[*] Auto-detected SLC list: {self.slc_file_list}")
-            else:
-                sys.exit("[!] Error: No matching SLC list file found. Please run Step 1 first.")
-            
-        slc_groups = {}
-        date_pattern = re.compile(r'S1[A-D]_.*_(\d{8})T')
+        # 1. Bounding Box Calculation (Shared for both modes)
+        # In main(), --lon and --lat are strictly required, so this is safe.
+        d = self.args.dlonlat
+        min_lat = self.lat - d
+        max_lat = self.lat + d
+        min_lon = self.lon - d
+        max_lon = self.lon + d
         
-        with open(self.slc_file_list, 'r') as f:
-            for line in f:
-                fname = line.strip()
-                if not fname: continue
-                if not fname.endswith('.zip'): fname += '.zip'
+        # 2. Auto-detect DEM file (Shared for both modes)
+        dem_candidates = glob.glob(os.path.join(self.work_dir, "DEM", "*.dem.wgs84"))
+        if not dem_candidates:
+            sys.exit("[!] Error: No *.dem.wgs84 file found in DEM/ directory. Please run Step 4.")
+        
+        dem_name = os.path.basename(dem_candidates[0])
+        dem_path_abs = os.path.join(self.work_dir, "DEM", dem_name)
+        print(f"[*] Found DEM: {dem_path_abs}")
+
+        # ==========================================
+        # Mode A: Pair (Generate topsApp.py XMLs)
+        # ==========================================
+        if self.mode == 'pair':
+            # Ensure list file 
+            if not self.slc_file_list:
+                self.slc_file_list = self._auto_detect_list_file()
+                if self.slc_file_list:
+                    print(f"[*] Auto-detected SLC list: {self.slc_file_list}")
+                else:
+                    sys.exit("[!] Error: No matching SLC list file found. Please run Step 1 first.")
+            
+            slc_groups = {}
+            date_pattern = re.compile(r'S1[A-D]_.*_(\d{8})T')
+            
+            with open(self.slc_file_list, 'r') as f:
+                for line in f:
+                    fname = line.strip()
+                    if not fname: continue
+                    if not fname.endswith('.zip'): fname += '.zip'
+                    
+                    m = date_pattern.search(fname)
+                    if m:
+                        date_key = m.group(1)
+                        if date_key not in slc_groups:
+                            slc_groups[date_key] = []
+                        slc_groups[date_key].append(fname)
+            
+            # Sort Dates
+            dates = sorted(slc_groups.keys())
+            if len(dates) != 2:
+                print(f"[!] Error: Found {len(dates)} unique dates in list: {dates}")
+                sys.exit("[!] Standard D-InSAR requires exactly 2 dates (Reference & Secondary).")
                 
-                m = date_pattern.search(fname)
-                if m:
-                    date_key = m.group(1)
-                    if date_key not in slc_groups:
-                        slc_groups[date_key] = []
-                    slc_groups[date_key].append(fname)
-        
-        # Sort Dates
-        dates = sorted(slc_groups.keys())
-        if len(dates) != 2:
-            print(f"[!] Error: Found {len(dates)} unique dates in list: {dates}")
-            sys.exit("[!] Standard InSAR requires exactly 2 dates (Reference & Secondary).")
+            ref_date, sec_date = dates[0], dates[1]
+            ref_files = slc_groups[ref_date]
+            sec_files = slc_groups[sec_date]
             
-        ref_date, sec_date = dates[0], dates[1]
-        ref_files = slc_groups[ref_date]
-        sec_files = slc_groups[sec_date]
-        
-        print(f"[*] Reference Date: {ref_date} ({len(ref_files)} files)")
-        print(f"[*] Secondary Date: {sec_date} ({len(sec_files)} files)")
-        
-        # Helper to format list string
-        def fmt_safe_paths(file_list):
-            paths = [os.path.join(self.work_dir, "SLC", f) for f in file_list]
-            return str(paths).replace('"', "'")
+            print(f"[*] Reference Date: {ref_date} ({len(ref_files)} files)")
+            print(f"[*] Secondary Date: {sec_date} ({len(sec_files)} files)")
+            
+            # Helper to format list string
+            def fmt_safe_paths(file_list):
+                paths = [os.path.join(self.work_dir, "SLC", f) for f in file_list]
+                return str(paths).replace('"', "'")
 
-        orbit_dir = os.path.join(self.work_dir, "orbits")
+            orbit_dir = os.path.join(self.work_dir, "orbits")
 
-        # Write reference.xml
-        ref_xml = f"""<component name="reference">
+            # Write reference.xml
+            ref_xml = f"""<component name="reference">
     <property name="orbit directory">{orbit_dir}</property>
     <property name="output directory">./reference</property>
     <property name="safe">{fmt_safe_paths(ref_files)}</property>
 </component>
 """
-        with open(os.path.join(process_dir, "reference.xml"), "w") as f:
-            f.write(ref_xml)
+            with open(os.path.join(process_dir, "reference.xml"), "w") as f:
+                f.write(ref_xml)
 
-        # Write secondary.xml
-        sec_xml = f"""<component name="secondary">
+            # Write secondary.xml
+            sec_xml = f"""<component name="secondary">
     <property name="orbit directory">{orbit_dir}</property>
     <property name="output directory">./secondary</property>
     <property name="safe">{fmt_safe_paths(sec_files)}</property>
 </component>
 """
-        with open(os.path.join(process_dir, "secondary.xml"), "w") as f:
-            f.write(sec_xml)
+            with open(os.path.join(process_dir, "secondary.xml"), "w") as f:
+                f.write(sec_xml)
 
-        # Auto-detect DEM file
-        dem_candidates = glob.glob(os.path.join("DEM", "*.dem.wgs84"))
-        if not dem_candidates:
-            sys.exit("[!] Error: No *.dem.wgs84 file found in DEM/ directory.")
-        
-        dem_name = os.path.basename(dem_candidates[0])
-        
-        dem_path = os.path.join(self.work_dir, "DEM", dem_name)
-        print(f"[*] Found DEM: {dem_path}")
-
-        # Calculate ROI
-        roi_string = "[]" 
-        
-        if self.lat is not None and self.lon is not None:
-            d = self.args.dlonlat
-            min_lat = self.lat - d
-            max_lat = self.lat + d
-            min_lon = self.lon - d
-            max_lon = self.lon + d
-            
             roi_string = f"[{min_lat:.4f}, {max_lat:.4f}, {min_lon:.4f}, {max_lon:.4f}]"
             print(f"[*] Region of Interest set to: {roi_string}")
-        else:
-            print("[*] No center coordinates provided. Region of Interest set to [] (Full Frame).")
 
-        # Write tops.xml
-        tops_xml = f"""<topsApp>
+            # Write tops.xml
+            tops_xml = f"""<topsApp>
     <component name="topsinsar">
         <property name="Sensor name">SENTINEL1</property>
         <component name="reference">
@@ -726,7 +787,7 @@ class AutoInSAR_Pipeline:
         <component name="secondary">
             <catalog>secondary.xml</catalog>
         </component>
-        <property name="demFilename">{dem_path}</property>
+        <property name="demFilename">{dem_path_abs}</property>
         <property name="swaths">[1,2,3]</property>
         <property name="range looks">20</property>
         <property name="azimuth looks">5</property>
@@ -739,63 +800,350 @@ class AutoInSAR_Pipeline:
     </component>
 </topsApp>
 """
-        with open(os.path.join(process_dir, "tops.xml"), "w") as f:
-            f.write(tops_xml)
+            with open(os.path.join(process_dir, "tops.xml"), "w") as f:
+                f.write(tops_xml)
+                
+            print(f"[*] Step 5 Pair config completed. XML files generated in: {process_dir}")
+
+        # ==========================================
+        # Mode B: Stack (Generate stackSentinel.py scripts)
+        # ==========================================
+        elif self.mode == 'stack':
+            # Create AUX directory to satisfy ISCE2 strict parameter requirements
+            aux_dir = os.path.join(self.work_dir, "AUX")
+            os.makedirs(aux_dir, exist_ok=True)
             
-        print(f"[*] Step 5 Xml completed, files generated in: {process_dir}")
-        
+            # Bounding Box format for stackSentinel: 'minLat maxLat minLon maxLon'
+            bbox_str = f"{min_lat:.4f} {max_lat:.4f} {min_lon:.4f} {max_lon:.4f}"
+            print(f"[*] Stack Bounding Box (S N W E): '{bbox_str}'")
+            
+            # Construct command. 
+            # Note: The script runs INSIDE 'process/', so directories are '../'
+            cmd = (
+                f"stackSentinel.py "
+                f"-s ../SLC/ "
+                f"-o ../orbits/ "
+                f"-a ../AUX/ "
+                f"-d ../DEM/{dem_name} "
+                f"-W slc "
+                f"-useGPU "
+                f"-b '{bbox_str}'"
+            )
+            
+            cwd = os.getcwd()
+            try:
+                os.chdir(process_dir)
+                print(f"[*] Executing stackSentinel.py to map network and build run_* scripts...")
+                self.run_command(cmd)
+            except Exception as e:
+                print(f"[!] Error generating stack scripts: {e}")
+                sys.exit(1)
+            finally:
+                os.chdir(cwd)
+                
+            print(f"[*] Step 5 Stack config completed. 'run_*' scripts generated in: {process_dir}")
+            
     # --------------------------------------------------------------------------
     # Step 6: ISCE Processing
     # --------------------------------------------------------------------------
     def step_6_process_isce(self):
         print("\n" + "="*50)
-        print(">>> Step 6: Running ISCE topsApp.py")
+        if self.mode == 'pair':
+            print(">>> Step 6: Running ISCE topsApp.py (Pair Mode)")
+        else:
+            print(">>> Step 6: Running ISCE Stack Scripts (Stack Mode)")
         print("="*50)
-
-        # Check Environment    
-        if shutil.which("topsApp.py") is None:
-            print("[!] Error: 'topsApp.py' command not found in system PATH!")
-            print("    This step requires ISCE2 software environment.")
-            print("    Please load your ISCE2 environment and try again.")
-            sys.exit(1)
 
         process_dir = os.path.join(self.work_dir, "process")
         if not os.path.exists(process_dir):
             sys.exit("[!] Error: 'process' directory not found. Please run Step 5 first.")
 
-        # print
-        print("[*] Processing started")
         print(f"[*] Switching to directory: {process_dir}")
-        print("[*] Executing: topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'")
-        print("    (This may take several hours depending on your hardware...)")
-
         cwd = os.getcwd()
+        
         try:
+            # 工作目录必须在 process/ 下，因为脚本内部都是基于此的相对路径
             os.chdir(process_dir)
-            
-            # The standard full InSAR processing command
-            cmd = "topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'"
-            self.run_command(cmd, quiet=True)
-            
+
+            # ==========================================
+            # Mode A: Pair (Execute topsApp.py)
+            # ==========================================
+            if self.mode == 'pair':
+                if shutil.which("topsApp.py") is None:
+                    sys.exit("[!] Error: 'topsApp.py' not found in PATH! Load ISCE2 environment.")
+                
+                print("[*] Executing: topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'")
+                print("    (This may take several hours depending on your hardware...)")
+                
+                cmd = "topsApp.py tops.xml --steps --start='startup' --end='geocodeoffsets'"
+                self.run_command(cmd, quiet=True)
+                print(f"[*] Step 6 Pair processing finished.")
+
+            # ==========================================
+            # Mode B: Stack (Execute run_* sequentially)
+            # ==========================================
+            elif self.mode == 'stack':
+                run_dir = "run_files"
+                print(f"[*] Scanning for 'run_*' scripts in '{run_dir}/'...")
+                
+                # 去 run_files 子目录里匹配脚本
+                run_files = glob.glob(os.path.join(run_dir, "run_*"))
+                
+                valid_runs = []
+                for f in run_files:
+                    if os.path.isfile(f):
+                        # 使用 basename 提取数字，防止路径名干扰
+                        match = re.search(r'run_(\d+)', os.path.basename(f))
+                        if match:
+                            valid_runs.append((int(match.group(1)), f))
+                
+                if not valid_runs:
+                    sys.exit(f"[!] Error: No 'run_*' scripts found in 'process/{run_dir}/'. Please run Step 5 first.")
+                
+                # Sort numerically (1, 2, 3... instead of 1, 10, 11, 2...)
+                valid_runs.sort(key=lambda x: x[0])
+                total_scripts = len(valid_runs)
+                
+                print(f"[*] Found {total_scripts} stack processing scripts.")
+                print("    (This will take significant time depending on the number of SLCs...)")
+                
+                for idx, (run_num, script_name) in enumerate(valid_runs, 1):
+                    print("-" * 40)
+                    print(f"[Progress: {idx}/{total_scripts}] Executing: {script_name}")
+                    
+                    # Execute the bash script directly via 'sh'
+                    # 命令将会是: sh run_files/run_01_unpack_topo_reference
+                    cmd = f"sh {script_name}"
+                    
+                    try:
+                        # We use quiet=True so the console isn't flooded, but ISCE2 will 
+                        # still write to its log files natively.
+                        self.run_command(cmd, quiet=True)
+                    except Exception as e:
+                        print(f"\n[!] CRITICAL ERROR during {script_name}")
+                        print("    Processing stopped. Please check ISCE2 logs for details.")
+                        sys.exit(1)
+                
+                print(f"\n[*] Step 6 Stack processing finished successfully!")
+                print(f"[*] Coregistered SLCs are ready in: {os.path.join(process_dir, 'merged', 'SLC')}")
+
         except KeyboardInterrupt:
             print("\n[!] Process interrupted by user.")
             sys.exit(1)
         except Exception as e:
-            print(f"[!] Error during ISCE processing: {e}")
+            print(f"[!] Unexpected error during processing: {e}")
             sys.exit(1)
         finally:
             os.chdir(cwd)
-        
-        print(f"[*] Step 6 ISCE finished, files generated in: {process_dir}")        
-
+            
     # --------------------------------------------------------------------------
-    # Step 7: Post Processing 
+    # Step 7: Post Processing & Baseline Visualization
     # --------------------------------------------------------------------------
     def step_7_post_process(self):
         print("\n" + "="*50)
-        print(">>> Step 7: Result Extraction & Plotting")
+        if self.mode == 'pair':
+            print(">>> Step 7: Result Extraction & Visualization (Pair Mode)")
+        else:
+            print(">>> Step 7: Baseline Network Analysis & Command Generation (Stack Mode)")
         print("="*50)
 
+        # ==========================================
+        # Mode B: Stack (Baseline Plot & Mode Recommendation)
+        # ==========================================
+        if self.mode == 'stack':
+            print("[*] Mode: STACK (Time-Series)")
+            print("[*] Extracting Spatiotemporal Baseline Network from ISCE2 outputs...")
+            
+            result_dir = os.path.join(self.work_dir, "results")
+            os.makedirs(result_dir, exist_ok=True)
+
+            # ISCE2 stackSentinel outputs baselines usually in 'baselines' or 'merged/baselines'
+            base_search_paths = [
+                os.path.join(self.work_dir, "process", "baselines"),
+                os.path.join(self.work_dir, "process", "merged", "baselines")
+            ]
+            
+            baselines_dir = None
+            for p in base_search_paths:
+                if os.path.exists(p):
+                    baselines_dir = p
+                    break
+                    
+            if not baselines_dir:
+                print(f"[!] Warning: Baseline directory not found. Plot skipped.")
+                return
+
+            # Find all YYYYMMDD_YYYYMMDD pair folders
+            pairs = glob.glob(os.path.join(baselines_dir, "20*_20*"))
+            if not pairs:
+                print("[!] No baseline pair folders found.")
+                return
+
+            dates_bperp = {}
+
+            print("[*] Parsing baseline grids...")
+            for p in pairs:
+                folder_name = os.path.basename(p)
+                ref_str, sec_str = folder_name.split('_')
+                
+                ref_dt = datetime.strptime(ref_str, "%Y%m%d")
+                sec_dt = datetime.strptime(sec_str, "%Y%m%d")
+                
+                # Read bperp using GDAL
+                bperp_file = os.path.join(p, "bperp.rdr")
+                bperp_val = 0.0
+                if os.path.exists(bperp_file):
+                    try:
+                        ds = gdal.Open(bperp_file, gdal.GA_ReadOnly)
+                        if ds:
+                            bperp_arr = ds.GetRasterBand(1).ReadAsArray()
+                            if bperp_arr is not None:
+                                bperp_val = float(np.nanmean(bperp_arr))
+                            ds = None
+                    except Exception:
+                        pass
+                
+                dates_bperp[sec_dt] = bperp_val
+                if ref_dt not in dates_bperp:
+                    dates_bperp[ref_dt] = 0.0 # Origin reference
+
+            dates_sorted = sorted(dates_bperp.keys())
+            if len(dates_sorted) < 2:
+                print("[!] Not enough dates to plot baselines.")
+                return
+                
+            days = np.array([(d - dates_sorted[0]).days for d in dates_sorted])
+            bperps = np.array([dates_bperp[d] for d in dates_sorted])
+
+            # ------------------------------------------
+            # 1. Optimal Master Selection for PS
+            # ------------------------------------------
+            # Normalize to find the spatiotemporal center
+            norm_days = (days - np.min(days)) / (np.max(days) - np.min(days) + 1e-6)
+            norm_bps = (bperps - np.min(bperps)) / (np.max(bperps) - np.min(bperps) + 1e-6)
+            
+            # Distance to the centroid (0.5, 0.5)
+            dist_to_center = (norm_days - 0.5)**2 + (norm_bps - 0.5)**2
+            opt_idx = np.argmin(dist_to_center)
+            
+            opt_date = dates_sorted[opt_idx]
+            opt_date_str = opt_date.strftime("%Y%m%d")
+            
+            # Re-reference bperps to the optimal master
+            bperps_ps = bperps - bperps[opt_idx]
+            
+            print(f"[*] Calculated Optimal Reference Date for PS: {opt_date_str}")
+
+            # ------------------------------------------
+            # 2. Plotting PS Network (Star Topology)
+            # ------------------------------------------
+            ps_plot_path = os.path.join(result_dir, f"stack_baselines_PS_{opt_date_str}.png")
+            try:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                for i in range(len(dates_sorted)):
+                    if i != opt_idx:
+                        ax.plot([opt_date, dates_sorted[i]], [0.0, bperps_ps[i]], '-', color='gray', alpha=0.5, linewidth=1.5)
+                
+                ax.scatter(dates_sorted, bperps_ps, c='dodgerblue', s=60, edgecolors='k', zorder=5)
+                ax.scatter([opt_date], [0.0], c='red', s=200, marker='*', edgecolors='k', zorder=6, label=f'Optimal Master ({opt_date_str})')
+                
+                ax.set_xlabel("Acquisition Date", fontsize=12, fontweight='bold')
+                ax.set_ylabel("Perpendicular Baseline (m)", fontsize=12, fontweight='bold')
+                ax.set_title(f"PS Mode Baseline Network (Ref: {opt_date_str})", fontsize=14, fontweight='bold')
+                ax.grid(True, linestyle='--', alpha=0.6)
+                ax.legend(loc='best')
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(ps_plot_path, dpi=300)
+                plt.close()
+                print(f"    -> Generated: {ps_plot_path}")
+            except Exception as e:
+                print(f"[!] Failed to generate PS baseline plot: {e}")
+
+            # ------------------------------------------
+            # 3. Plotting SBAS Network (Chain Topology, neighbors=2)
+            # ------------------------------------------
+            neighbors = 2
+            sbas_plot_path = os.path.join(result_dir, f"stack_baselines_SBAS_{neighbors}.png")
+            try:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                # Connect each date to its next 'neighbors' dates
+                for i in range(len(dates_sorted)):
+                    for j in range(1, neighbors + 1):
+                        if i + j < len(dates_sorted):
+                            ax.plot([dates_sorted[i], dates_sorted[i+j]], [bperps_ps[i], bperps_ps[i+j]], '-', color='cornflowerblue', alpha=0.7, linewidth=1.5)
+                
+                ax.scatter(dates_sorted, bperps_ps, c='gold', s=60, edgecolors='k', zorder=5, label='SAR Image Node')
+                
+                ax.set_xlabel("Acquisition Date", fontsize=12, fontweight='bold')
+                ax.set_ylabel("Perpendicular Baseline (m)", fontsize=12, fontweight='bold')
+                ax.set_title(f"SBAS Mode Baseline Network (Temporal Neighbors: {neighbors})", fontsize=14, fontweight='bold')
+                ax.grid(True, linestyle='--', alpha=0.6)
+                ax.legend(loc='best')
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(sbas_plot_path, dpi=300)
+                plt.close()
+                print(f"    -> Generated: {sbas_plot_path}")
+            except Exception as e:
+                print(f"[!] Failed to generate SBAS baseline plot: {e}")
+
+            # ------------------------------------------
+            # 4. Generate Command Text File
+            # ------------------------------------------
+            cmd_file_path = os.path.join(result_dir, "stamps_hpc_commands.txt")
+            
+            ps_cmd = (
+                f"make_isce_stack_ps.sh {opt_date_str} "
+                "process/merged/SLC process/merged/geom_reference process/merged/baselines 20 5"
+            )
+            sbas_cmd = (
+                f"make_isce_stack_sbas.sh {neighbors} "
+                "process/merged/SLC process/merged/geom_reference process/merged/baselines 20 5"
+            )
+            
+            cmd_text = (
+                "=========================================================\n"
+                "      StaMPS-HPC Pre-processing Execution Commands       \n"
+                "=========================================================\n"
+                "Data preparation is complete. Please review the generated\n"
+                "baseline plots in this folder to decide your network strategy.\n\n"
+                
+                "[OPTION A] Persistent Scatterer (PS) Mode\n"
+                f"Optimal Master Selected: {opt_date_str}\n"
+                "Execute the following command in your terminal:\n\n"
+                f"{ps_cmd}\n\n"
+                
+                "---------------------------------------------------------\n"
+                "[OPTION B] Small Baseline Subset (SBAS) Mode\n"
+                f"Temporal Neighbors Configured: {neighbors}\n"
+                "Execute the following command in your terminal:\n\n"
+                f"{sbas_cmd}\n"
+                "=========================================================\n"
+            )
+            
+            try:
+                with open(cmd_file_path, "w") as f:
+                    f.write(cmd_text)
+            except Exception as e:
+                print(f"[!] Failed to write commands file: {e}")
+
+            print("\n" + "*"*65)
+            print("🌟 MISSION ACCOMPLISHED: DATA READY FOR STAMPS-HPC 🌟")
+            print("*"*65)
+            print(f"[*] Visualized baseline networks and command snippets have been")
+            print(f"    saved to your results directory:")
+            print(f"    -> {result_dir}/")
+            print("\n>>> NEXT STEP:")
+            print("    Please open 'stamps_hpc_commands.txt' in the results folder,")
+            print("    copy your preferred processing command (PS or SBAS),")
+            print("    and execute it in your terminal to start StaMPS-HPC.")
+            print("*"*65 + "\n")
+            return
+
+        # ==========================================
+        # Mode A: Pair (Extract and Plot D-InSAR Results)
+        # ==========================================
         # Setup Directories
         merged_dir = os.path.join(self.work_dir, "process", "merged")
         result_dir = os.path.join(self.work_dir, "results")
@@ -997,14 +1345,21 @@ class AutoInSAR_Pipeline:
     # --------------------------------------------------------------------------
     def step_8_cleanup(self):
         print("\n" + "="*50)
-        print(">>> Step 8: Cleaning Up Intermediate Files")
+        if self.mode == 'pair':
+            print(">>> Step 8: Cleaning Up Intermediate Files (Pair Mode)")
+        else:
+            print(">>> Step 8: Extreme Cleanup for Time-Series (Stack Mode)")
         print("="*50)
         
         # Safety Check
         print("[!] WARNING: This will DELETE source data (SLC, DEM, Orbits) and intermediate directories.")
-        print("    'results/', 'process/merged/', and XML/log files in 'process/' will be KEPT.")
+        if self.mode == 'pair':
+            print("    'results/', 'process/merged/' (filtered), and XML/log files in 'process/' will be KEPT.")
+        else:
+            print("    ONLY 'process/merged/' and root script files will be KEPT to save massive disk space.")
         
-        # Clean Top-level Directories (SLC, DEM, orbits)
+        # 1. Clean Top-level Directories (SLC, DEM, orbits)
+        # Shared for both Pair and Stack modes
         targets = ["SLC", "DEM", "orbits"]
         for t in targets:
             dpath = os.path.join(self.work_dir, t)
@@ -1014,12 +1369,12 @@ class AutoInSAR_Pipeline:
             else:
                 print(f"    - {t}/ already removed or not found.")
 
-        # Clean 'process' directory (Keep 'merged' folder AND all files)
+        # 2. Clean 'process' directory sub-folders
         process_dir = os.path.join(self.work_dir, "process")
         merged_dir = os.path.join(process_dir, "merged")
         
         if os.path.exists(process_dir):
-            print(f"[*] Cleaning 'process/' directory (Deleting sub-directories only, keeping files)...")
+            print(f"[*] Cleaning 'process/' directory (Deleting sub-directories except 'merged')...")
             for item in os.listdir(process_dir):
                 item_path = os.path.join(process_dir, item)
                 
@@ -1027,6 +1382,7 @@ class AutoInSAR_Pipeline:
                     continue
                 
                 try:
+                    # Only delete directories (like coreg_secondarys, reference, etc.), keep log/xml files
                     if os.path.isdir(item_path) and not os.path.islink(item_path):
                         shutil.rmtree(item_path)
                 except Exception as e:
@@ -1034,55 +1390,67 @@ class AutoInSAR_Pipeline:
         else:
             print("[!] 'process/' directory not found.")
 
-        # Clean 'process/merged' (Keep specific patterns)
+        # 3. Clean 'process/merged' based on Mode
         if os.path.exists(merged_dir):
-            print(f"[*] Cleaning 'process/merged/' (applying retention filter)...")
             
-            # Whitelist patterns
-            keep_patterns = [
-                "azimuth_angle_*_cut.grd",
-                "azimuth_offset_*_cut.grd",
-                "coherence_*_cut.grd",
-                "look_angle_*_cut.grd",
-                "los_*_cut.grd",
-                "range_offset_*_cut.grd",
-                "snr_*_cut.int",
-                "wrap_*_cut.int",
-                "filt_topophase.unw.geo*",
-                "filt_topophase.flat*",
-                "phsig.cor.geo*",
-                "los.rdr.geo*",
-                "filt_dense_offsets.bil*",
-                "dense_offsets_snr.bil.geo*"
-            ]
-            
-            deleted_count = 0
-            kept_count = 0
-            
-            for fname in os.listdir(merged_dir):
-                file_path = os.path.join(merged_dir, fname)
+            # ==========================================
+            # Mode A: Pair (Strict Filter)
+            # ==========================================
+            if self.mode == 'pair':
+                print(f"[*] Cleaning 'process/merged/' (applying retention filter for Pair Mode)...")
                 
-                should_keep = False
-                for pattern in keep_patterns:
-                    if fnmatch.fnmatch(fname, pattern):
-                        should_keep = True
-                        break
+                # Whitelist patterns
+                keep_patterns = [
+                    "azimuth_angle_*_cut.grd",
+                    "azimuth_offset_*_cut.grd",
+                    "coherence_*_cut.grd",
+                    "look_angle_*_cut.grd",
+                    "los_*_cut.grd",
+                    "range_offset_*_cut.grd",
+                    "snr_*_cut.int",
+                    "wrap_*_cut.int",
+                    "filt_topophase.unw.geo*",
+                    "filt_topophase.flat*",
+                    "phsig.cor.geo*",
+                    "los.rdr.geo*",
+                    "filt_dense_offsets.bil*",
+                    "dense_offsets_snr.bil.geo*"
+                ]
                 
-                if should_keep:
-                    kept_count += 1
-                else:
-                    try:
-                        if os.path.isfile(file_path) or os.path.islink(file_path):
-                            os.unlink(file_path)
-                            deleted_count += 1
-                        elif os.path.isdir(file_path):
-                            shutil.rmtree(file_path)
-                            deleted_count += 1
-                    except Exception as e:
-                        print(f"    [!] Failed to delete {fname}: {e}")
+                deleted_count = 0
+                kept_count = 0
+                
+                for fname in os.listdir(merged_dir):
+                    file_path = os.path.join(merged_dir, fname)
+                    
+                    should_keep = False
+                    for pattern in keep_patterns:
+                        if fnmatch.fnmatch(fname, pattern):
+                            should_keep = True
+                            break
+                    
+                    if should_keep:
+                        kept_count += 1
+                    else:
+                        try:
+                            if os.path.isfile(file_path) or os.path.islink(file_path):
+                                os.unlink(file_path)
+                                deleted_count += 1
+                            elif os.path.isdir(file_path):
+                                shutil.rmtree(file_path)
+                                deleted_count += 1
+                        except Exception as e:
+                            print(f"    [!] Failed to delete {fname}: {e}")
 
-            print(f"    - Deleted: {deleted_count} files")
-            print(f"    - Kept   : {kept_count} files")
+                print(f"    - Deleted: {deleted_count} files")
+                print(f"    - Kept   : {kept_count} files")
+                
+            # ==========================================
+            # Mode B: Stack (Keep All)
+            # ==========================================
+            elif self.mode == 'stack':
+                print(f"[*] Mode: STACK -> 'process/merged/' is kept completely intact for StaMPS-HPC.")
+                print("    (All coregistered SLCs, geometry, and baselines are preserved).")
 
         print("[*] Step 8 Cleanup completed.")
     
@@ -1285,16 +1653,24 @@ class AutoInSAR_Pipeline:
         return cands[0]
 
 def main():
-    parser = argparse.ArgumentParser(description="Auto InSAR Processing Pipeline")
+    parser = argparse.ArgumentParser(description="Auto InSAR Processing Pipeline (Pair & Stack Modes)")
+    
+    # Mode Selection
+    parser.add_argument("--mode", type=str, default="pair", choices=["pair", "stack"],
+                        help="Processing mode: 'pair' for D-InSAR, 'stack' for Time-Series (Default: pair)")
     
     # Coordinates
-    parser.add_argument("--lon", type=float, help="Event Center Longitude")
-    parser.add_argument("--lat", type=float, help="Event Center Latitude")
+    parser.add_argument("--lon", type=float, help="Center Longitude of the area of interest")
+    parser.add_argument("--lat", type=float, help="Center Latitude of the area of interest")
     
-    # Dates (YYYYMMDD)
-    parser.add_argument("--event_date", type=str, help="Event Date (YYYYMMDD). Auto search +/- 12 days.")
-    parser.add_argument("--reference_date", type=str, help="Manual Reference Date (YYYYMMDD)")
-    parser.add_argument("--secondary_date", type=str, help="Manual Secondary Date (YYYYMMDD)")
+    # Dates for Pair Mode (D-InSAR)
+    parser.add_argument("--event_date", type=str, help="[Pair Mode] Event Date (YYYYMMDD). Auto search +/- 12 days.")
+    parser.add_argument("--reference_date", type=str, help="[Pair Mode] Manual Reference Date (YYYYMMDD)")
+    parser.add_argument("--secondary_date", type=str, help="[Pair Mode] Manual Secondary Date (YYYYMMDD)")
+    
+    # Dates for Stack Mode (Time-Series)
+    parser.add_argument("--start_date", type=str, help="[Stack Mode] Start Date for time-series (YYYYMMDD)")
+    parser.add_argument("--end_date", type=str, help="[Stack Mode] End Date for time-series (YYYYMMDD)")
     
     # Platform
     parser.add_argument("--platform", type=str, default="Sentinel-1", 
@@ -1303,12 +1679,12 @@ def main():
                         help="Satellite Platform")
     
     # Orbit
-    parser.add_argument("--rel_orbit", type=str, help="Relative Orbit Number (Optional).")
+    parser.add_argument("--rel_orbit", type=int, help="Relative Orbit Number (Optional).")
     parser.add_argument("--dlonlat", type=float, default=0.2, help="Search buffer in degrees (Default: 0.2)")
     
     # Steps
     parser.add_argument("--step", type=str, default="all",
-                        choices=["search", "download", "orbit", "dem", "xml", "isce", "post", "clean", "all"],
+                        choices=["search", "download", "orbit", "dem", "config", "process", "post", "clean", "all"],
                         help="Execution step")
 
     if len(sys.argv) == 1:
@@ -1317,35 +1693,52 @@ def main():
         
     args = parser.parse_args()
     
+    # ==========================================
+    # Input Validation based on Mode
+    # ==========================================
+    if not args.lon or not args.lat:
+        parser.error("[!] Both --lon and --lat are required.")
+
+    if args.mode == 'pair':
+        if not args.event_date and not (args.reference_date and args.secondary_date):
+            parser.error("[!] Pair Mode requires either --event_date OR both --reference_date and --secondary_date")
+    elif args.mode == 'stack':
+        if not args.start_date or not args.end_date:
+            parser.error("[!] Stack Mode requires both --start_date and --end_date")
+    
+    # ==========================================
+    # Pipeline Execution
+    # ==========================================
     # timer start
     start_time = time.time()
     start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))
     print("\n" + "#"*60)
     print(f"[*] AutoInSAR Pipeline Started at: {start_str}")
-    print(f"[*] Execution Mode: Step='{args.step}'")
+    print(f"[*] Execution Mode : {args.mode.upper()}")
+    print(f"[*] Execution Step : '{args.step}'")
     print("#"*60)
     
     pipeline = AutoInSAR_Pipeline(args)
     
-    if args.step == "search" or args.step == "all":
+    if args.step in ["search", "all"]:
         pipeline.step_1_search_data()
     
-    if args.step == "download" or args.step == "all":
+    if args.step in ["download", "all"]:
         pipeline.step_2_download_data()
         
-    if args.step == "orbit" or args.step == "all":
+    if args.step in ["orbit", "all"]:
         pipeline.step_3_download_orbit()
         
-    if args.step == "dem" or args.step == "all":
+    if args.step in ["dem", "all"]:
         pipeline.step_4_download_dem()
         
-    if args.step == "xml" or args.step == "all":
+    if args.step in ["config", "all"]:
         pipeline.step_5_generate_xml()
         
-    if args.step == "isce" or args.step == "all":
+    if args.step in ["process", "all"]:
         pipeline.step_6_process_isce()
         
-    if args.step == "post" or args.step == "all":
+    if args.step in ["post", "all"]:
         pipeline.step_7_post_process()
         
     if args.step == "clean":
@@ -1359,6 +1752,7 @@ def main():
     # timer end
     print("\n" + "#"*60)
     print(f"[*] All Tasks Completed Successfully!")
+    print(f"[*] Mode       : {args.mode.upper()}")
     print(f"[*] Start Time : {start_str}")
     print(f"[*] End Time   : {end_str}")
     print(f"[*] Total Time : {duration_str}")
