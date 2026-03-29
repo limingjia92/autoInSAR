@@ -1361,16 +1361,41 @@ class AutoInSAR_Pipeline:
         else:
             print(">>> Step 8: Extreme Cleanup for Time-Series (Stack Mode)")
         print("="*50)
-        
+
+        process_dir = os.path.join(self.work_dir, "process")
+        merged_dir = os.path.join(process_dir, "merged")
+
+        # ==========================================
+        # SAFEGUARD: Prevent accidental deletion of Stack data
+        # ==========================================
+        stack_indicators = [
+            os.path.join(process_dir, "run_files"), 
+            os.path.join(merged_dir, "SLC"),
+            os.path.join(merged_dir, "baselines")
+        ]
+        is_actually_stack = any(os.path.exists(p) for p in stack_indicators)
+
+        if self.mode == 'pair' and is_actually_stack:
+            print("\n" + "!"*65)
+            print("[!] CRITICAL SAFETY ABORT: Mode mismatch detected!")
+            print("    You executed '--step clean' without specifying '--mode stack'.")
+            print("    The script defaulted to 'pair' mode, but detected Time-Series")
+            print("    (Stack) data in your directory.")
+            print("    Continuing would incorrectly DELETE your coregistered SLCs!")
+            print("\n    >>> Please re-run the correct command:")
+            print("        python autoInSAR.py --mode stack --step clean")
+            print("!"*65 + "\n")
+            sys.exit(1)
+        # ==========================================
+
         # Safety Check
-        print("[!] WARNING: This will DELETE source data (SLC, DEM, Orbits) and intermediate directories.")
+        print("[!] WARNING: This will DELETE source data (SLC, DEM, Orbits, AUX) and intermediate directories.")
         if self.mode == 'pair':
             print("    'results/', 'process/merged/' (filtered), and XML/log files in 'process/' will be KEPT.")
         else:
             print("    ONLY 'process/merged/' and root script files will be KEPT to save massive disk space.")
         
         # 1. Clean Top-level Directories (SLC, DEM, orbits, AUX)
-        # Shared for both Pair and Stack modes
         targets = ["SLC", "DEM", "orbits", "AUX"]
         for t in targets:
             dpath = os.path.join(self.work_dir, t)
