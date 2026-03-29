@@ -1369,9 +1369,9 @@ class AutoInSAR_Pipeline:
         else:
             print("    ONLY 'process/merged/' and root script files will be KEPT to save massive disk space.")
         
-        # 1. Clean Top-level Directories (SLC, DEM, orbits)
+        # 1. Clean Top-level Directories (SLC, DEM, orbits, AUX)
         # Shared for both Pair and Stack modes
-        targets = ["SLC", "DEM", "orbits"]
+        targets = ["SLC", "DEM", "orbits", "AUX"]
         for t in targets:
             dpath = os.path.join(self.work_dir, t)
             if os.path.exists(dpath):
