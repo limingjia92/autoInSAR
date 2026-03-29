@@ -981,7 +981,7 @@ class AutoInSAR_Pipeline:
 
             dates_bperp = {}
 
-            print("[*] Parsing baseline grids...")
+            print("[*] Parsing baseline text files...")
             for p in pairs:
                 folder_name = os.path.basename(p)
                 ref_str, sec_str = folder_name.split('_')
@@ -989,23 +989,34 @@ class AutoInSAR_Pipeline:
                 ref_dt = datetime.strptime(ref_str, "%Y%m%d")
                 sec_dt = datetime.strptime(sec_str, "%Y%m%d")
                 
-                # Read bperp using GDAL
-                bperp_file = os.path.join(p, "bperp.rdr")
                 bperp_val = 0.0
-                if os.path.exists(bperp_file):
-                    try:
-                        ds = gdal.Open(bperp_file, gdal.GA_ReadOnly)
-                        if ds:
-                            bperp_arr = ds.GetRasterBand(1).ReadAsArray()
-                            if bperp_arr is not None:
-                                bperp_val = float(np.nanmean(bperp_arr))
-                            ds = None
-                    except Exception:
-                        pass
+                txt_file = os.path.join(p, f"{folder_name}.txt")
                 
+                if os.path.exists(txt_file):
+                    try:
+                        with open(txt_file, 'r') as f:
+                            content = f.read()
+                            
+                            # Use regex to match all Bperp (average) values (handling multiple swaths)
+                            matches = re.findall(r'Bperp \(average\):\s*([-\d.]+)', content)
+                            
+                            if matches:
+                                # Convert all matched strings to floats and calculate the average
+                                bperp_values = [float(m) for m in matches]
+                                bperp_val = sum(bperp_values) / len(bperp_values)
+                            else:
+                                print(f"    [!] Warning: 'Bperp (average)' not found in {txt_file}")
+                    except Exception as e:
+                        print(f"    [!] Failed to read or parse {txt_file}: {e}")
+                else:
+                    print(f"    [!] Warning: Baseline text file missing: {txt_file}")
+                
+                # Record the baseline for the Secondary image
                 dates_bperp[sec_dt] = bperp_val
+                
+                # Initialize the Reference image baseline to 0.0 (if encountered for the first time)
                 if ref_dt not in dates_bperp:
-                    dates_bperp[ref_dt] = 0.0 # Origin reference
+                    dates_bperp[ref_dt] = 0.0
 
             dates_sorted = sorted(dates_bperp.keys())
             if len(dates_sorted) < 2:
