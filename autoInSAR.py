@@ -1707,15 +1707,17 @@ def main():
     # ==========================================
     # Input Validation based on Mode
     # ==========================================
-    if not args.lon or not args.lat:
-        parser.error("[!] Both --lon and --lat are required.")
+    # Skip strict parameter validation if the step is only 'clean'
+    if args.step != "clean":
+        if not args.lon or not args.lat:
+            parser.error("[!] Both --lon and --lat are required.")
 
-    if args.mode == 'pair':
-        if not args.event_date and not (args.reference_date and args.secondary_date):
-            parser.error("[!] Pair Mode requires either --event_date OR both --reference_date and --secondary_date")
-    elif args.mode == 'stack':
-        if not args.start_date or not args.end_date:
-            parser.error("[!] Stack Mode requires both --start_date and --end_date")
+        if args.mode == 'pair':
+            if not args.event_date and not (args.reference_date and args.secondary_date):
+                parser.error("[!] Pair Mode requires either --event_date OR both --reference_date and --secondary_date")
+        elif args.mode == 'stack':
+            if not args.start_date or not args.end_date:
+                parser.error("[!] Stack Mode requires both --start_date and --end_date")
     
     # ==========================================
     # Pipeline Execution
