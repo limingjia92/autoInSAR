@@ -151,7 +151,7 @@ class AutoInSAR_Pipeline:
             print(f"[!] Error executing command: {cmd}")
             sys.exit(1)
 
-# --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Step 1: SLC Data Search
     # --------------------------------------------------------------------------
     def step_1_search_data(self):
@@ -952,6 +952,57 @@ class AutoInSAR_Pipeline:
         # ==========================================
         if self.mode == 'stack':
             print("[*] Mode: STACK (Time-Series)")
+            
+            # ------------------------------------------
+            # Extract UTC passing time from SLC zip
+            # ------------------------------------------
+            print("[*] Extracting UTC passing time from SLC zip files...")
+            slc_dir = os.path.join(self.work_dir, "SLC")
+            geom_ref_dir = os.path.join(self.work_dir, "process", "merged", "geom_reference")
+            
+            zip_files = glob.glob(os.path.join(slc_dir, "*.zip"))
+            if zip_files:
+                first_zip = os.path.basename(zip_files[0])
+                
+                # Match start/stop times (e.g., T101333 ... T101400)
+                match = re.search(r'T(\d{6})_.*?T(\d{6})', first_zip)
+                
+                if match:
+                    t1_str, t2_str = match.groups()
+                    try:
+                        # Convert to datetime 
+                        t1 = datetime.strptime(t1_str, "%H%M%S")
+                        t2 = datetime.strptime(t2_str, "%H%M%S")
+                        
+                        # Handle rare midnight crossing
+                        if t2 < t1:
+                            t2 += timedelta(days=1)
+                            
+                        # Calculate mean time
+                        avg_time = t1 + (t2 - t1) / 2
+                        
+                        # Round to nearest minute
+                        if avg_time.second >= 30:
+                            avg_time += timedelta(minutes=1)
+                            
+                        final_time_str = avg_time.strftime("%H:%M")
+                        
+                        # Save to output file
+                        os.makedirs(geom_ref_dir, exist_ok=True)
+                        utc_file_path = os.path.join(geom_ref_dir, "utc_satellite.dat")
+                        with open(utc_file_path, "w") as f:
+                            f.write(final_time_str + "\n")
+                            
+                        print(f"    -> Extracted Time : {final_time_str} (from {first_zip})")
+                        print(f"    -> Saved to       : {utc_file_path}")
+                    except Exception as e:
+                        print(f"    [!] Error parsing time from {first_zip}: {e}")
+                else:
+                    print(f"    [!] Warning: Time pattern not found in {first_zip}")
+            else:
+                print("    [!] Warning: No *.zip files found in SLC/. Skipping UTC extraction.")
+            # ------------------------------------------
+
             print("[*] Extracting Spatiotemporal Baseline Network from ISCE2 outputs...")
             
             result_dir = os.path.join(self.work_dir, "results")
