@@ -40,11 +40,12 @@ The pipeline automates the following 8 steps dynamically based on the selected m
 * **NASA Earthdata Credentials**: You must have a `~/.netrc` file configured with your NASA Earthdata login to download SLCs and Orbits from ASF. (`chmod 600 ~/.netrc`).
 
 ## 4. Installation & Environment Setup
-**1. Clone the Repository**
-First, clone the repository to your local machine:
+**1. Clone the Repository & Make the Script Executable**
+First, clone the repository to your local machine, and ensure the main script has execution permissions:
 ```bash
 git clone https://github.com/limingjia92/autoInSAR.git
 cd autoInSAR
+chmod 755 autoInSAR.py
 ```
 
 **2. Add to System PATH (Recommended)**
@@ -58,11 +59,6 @@ Then, refresh your shell:
 source ~/.bashrc
 ```
 
-**3. Make the Script Executable**
-Ensure the main script has execution permissions:
-```bash
-chmod 755 autoInSAR.py
-```
 Now you can simply run `autoInSAR.py --lon ...` from any folder.
 
 ## 5. Usage Examples
