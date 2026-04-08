@@ -795,6 +795,7 @@ class AutoInSAR_Pipeline:
         <property name="do unwrap">True</property>
         <property name="unwrapper name">snaphu_mcf</property>
         <property name="do denseoffsets">True</property>
+        <property name="do ESD">True</property>
         <property name="filter strength">0.4</property>
         <property name="useGPU">True</property>
     </component>
