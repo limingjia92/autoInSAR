@@ -41,16 +41,16 @@ Dependencies:
 
 Usage Examples:
     [Pair Mode] 1. Earthquake / Event (Auto-search +/- 12 days):
-        $ python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --event_date 20251117 --platform S1A
+        $ autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --event_date 20251117 --platform S1A
 
     [Pair Mode] 2. Manual Dates:
-        $ python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --reference_date 20251113 --secondary_date 20251125
+        $ autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --reference_date 20251113 --secondary_date 20251125
 
     [Stack Mode] 3. Time-Series Preparation for StaMPS-HPC (Requires Relative Orbit):
-        $ python autoInSAR.py --mode stack --lon 40.7 --lat 13.6 --start_date 20200101 --end_date 20231231 --rel_orbit 14
+        $ autoInSAR.py --mode stack --lon 40.7 --lat 13.6 --start_date 20200101 --end_date 20231231 --rel_orbit 14
 
     [General] 4. Run a specific step only (e.g., Cleanup):
-        $ python autoInSAR.py --mode stack --step clean
+        $ autoInSAR.py --mode stack --step clean
 
 Author:
     Mingjia Li
@@ -1572,7 +1572,7 @@ class AutoInSAR_Pipeline:
         return data, (lons, lats, gt, proj)
 
     def _save_grd(self, result_dir, out_name, data, geo_info):
-        """save file in GMT GRD format"""
+        """save file in GMT GRD or GTiff format"""
         lons_cut, lats_cut, gt_orig, proj = geo_info
         new_gt = list(gt_orig)
         new_gt[0] = lons_cut[0]
@@ -1586,11 +1586,26 @@ class AutoInSAR_Pipeline:
         mem_ds.GetRasterBand(1).WriteArray(data)
         mem_ds.GetRasterBand(1).SetNoDataValue(np.nan)
         
-        driver = gdal.GetDriverByName('GMT')
+        driver_name = 'GMT'
+        driver = gdal.GetDriverByName(driver_name)
+        
+        if driver is None:
+            print(f"    [!] Warning: GDAL '{driver_name}' driver not found in this environment. Falling back to 'GTiff'.")
+            driver_name = 'GTiff'
+            driver = gdal.GetDriverByName(driver_name)
+            out_name = out_name.replace('.grd', '.tif') 
+            if out_name.endswith('.grd'):
+                out_name = out_name[:-4] + '.tif'
+            
+        if driver is None:
+            mem_ds = None
+            raise RuntimeError("Critical: Neither GMT nor GTiff GDAL drivers are available.")
+
         out_path = os.path.join(result_dir, out_name)
         if os.path.exists(out_path): os.remove(out_path)
         
         dst_ds = driver.CreateCopy(out_path, mem_ds, 0)
+    
         mem_ds = None
         dst_ds = None 
         
@@ -1600,7 +1615,8 @@ class AutoInSAR_Pipeline:
             try: os.remove(aux_xml)
             except OSError: pass
 
-        print(f"    -> Saved GRD: {out_name}")
+        fmt_label = "GRD" if driver_name == 'GMT' else "TIF"
+        print(f"    -> Saved {fmt_label}: {out_name}")
 
     def _get_robust_clim(self, data, symmetric=True):
         """get xlim/ylim for plot"""
