@@ -127,7 +127,8 @@ class AutoInSAR_Pipeline:
             "S1": "Sentinel-1",
             "S1A": "Sentinel-1A",
             "S1B": "Sentinel-1B",
-            "S1C": "Sentinel-1C"
+            "S1C": "Sentinel-1C",
+            "S1D": "Sentinel-1D"
         }
         self.platform = platform_map.get(args.platform, args.platform)
 
@@ -543,7 +544,7 @@ class AutoInSAR_Pipeline:
         # Parse SLC dates from list file
         needed = {} 
         for line in open(self.slc_file_list):
-            m = re.search(r'(S1[AB])_.*_(\d{8}T\d{6})_', line)
+            m = re.search(r'(S1[A-D])_.*_(\d{8}T\d{6})_', line)
             if m: needed[(m.group(1), datetime.strptime(m.group(2), "%Y%m%dT%H%M%S"))] = True
         
         # Sort requests by date
@@ -1713,16 +1714,16 @@ class AutoInSAR_Pipeline:
             return []
         
         # Regex to match filename parts: Platform, GenTime, Start, End
-        pat = re.compile(fr'(S1[AB])_OPER_AUX_{otype}_OPOD_(\d{{8}}T\d{{6}})_V(\d{{8}}T\d{{6}})_(\d{{8}}T\d{{6}})\.EOF')
+        pat = re.compile(fr'(S1[A-D])_OPER_AUX_{otype}_OPOD_(\d{{8}}T\d{{6}})_V(\d{{8}}T\d{{6}})_(\d{{8}}T\d{{6}})\.EOF')
         
         cands = []
         # Find all .EOF files first, then parse details
-        for fname in re.findall(fr'S1[AB]_OPER_AUX_{otype}_OPOD_[A-Z0-9_]+\.EOF', txt):
+        for fname in re.findall(fr'S1[A-D]_OPER_AUX_{otype}_OPOD_[A-Z0-9_]+\.EOF', txt):
             m = pat.match(fname)
             if m:
                 cands.append({
                     'file': fname, 
-                    'p': m.group(1),                  # Platform (S1A/S1B)
+                    'p': m.group(1),                  # Platform (S1A/S1B/S1C/S1D)
                     'gen': m.group(2),                # Generation Time
                     's': datetime.strptime(m.group(3), "%Y%m%dT%H%M%S"), # Start
                     'e': datetime.strptime(m.group(4), "%Y%m%dT%H%M%S")  # End
@@ -1778,8 +1779,8 @@ def main():
     
     # Platform
     parser.add_argument("--platform", type=str, default="Sentinel-1", 
-                        choices=["Sentinel-1", "Sentinel-1A", "Sentinel-1B", "Sentinel-1C",
-                                 "S1", "S1A", "S1B", "S1C"],
+                        choices=["Sentinel-1", "Sentinel-1A", "Sentinel-1B", "Sentinel-1C", "Sentinel-1D",
+                                 "S1", "S1A", "S1B", "S1C", "S1D"],
                         help="Satellite Platform")
     
     # Orbit
