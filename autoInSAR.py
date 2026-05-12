@@ -87,7 +87,7 @@ import math
 import time
 import fnmatch
 from datetime import datetime, timedelta
-
+import asf_search as asf
 # for post processing
 try:
     import numpy as np
@@ -252,7 +252,19 @@ class AutoInSAR_Pipeline:
             try:
                 if len(query_time_ranges) > 1:
                      print(f"    Running query {idx+1}/{len(query_time_ranges)} for range {t_start[:10]}...")
-                
+
+                 if asf is not None:
+                    asf_results = asf.search(
+                        platform=self.platform,
+                        processingLevel="SLC",
+                        beamMode="IW",
+                        start=t_start,
+                        end=t_end,
+                        bbox=bbox,
+                        relativeOrbit=self.rel_orbit
+                    )
+                    all_results.extend(asf_results)
+                      
                 response = requests.get(self.api_url, params=params, timeout=60)
                 response.raise_for_status()
                 data = json.loads(response.text)
