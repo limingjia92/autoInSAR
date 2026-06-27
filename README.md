@@ -199,7 +199,7 @@ After a successful run and cleanup (Step 8), the output directory will be drasti
 └── results/
     ├── los_disp.grd            # Line-of-Sight Displacement (m)
     ├── coherence.grd           # Interferometric Coherence
-    ├── vec_E.grd / vec_N.grd   # 3D Decomposition vectors (East/North)
+    ├── vec_E/N/U.grd           # 3D Decomposition vectors (East/North/Vertical)
     ├── offset_range.grd        # Pixel-offset in Range direction (m)
     ├── offset_azimuth.grd      # Pixel-offset in Azimuth direction (m)
     └── plot_asc_XX/            # Publication-ready PNG Visualizations
