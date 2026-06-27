@@ -97,6 +97,7 @@ First, clone the repository to your local machine, and ensure the main script ha
 git clone https://github.com/limingjia92/autoInSAR.git
 cd autoInSAR
 chmod 755 autoInSAR.py
+
 ```
 
 **2. Add to System PATH (Recommended)**
