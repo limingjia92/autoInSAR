@@ -20,7 +20,7 @@ The pipeline operates in two distinct modes controlled by the `--mode` argument:
 
 The pipeline automates the following 8 steps dynamically based on the selected mode:
 
-1.  **Search**: Auto-query SLC images from the ASF API. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks.
+1.  **Search**: Auto-query SLC images from ASF (default) or Copernicus Data Space Ecosystem. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks.
 2.  **Download**: Sequential downloading of SLC data with ZIP integrity verification and auto-resume.
 3.  **Orbit**: Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files with robust time-window matching.
 4.  **DEM**: Auto-download and stitch SRTMGL1 DEM tiles covering the region of interest.
@@ -37,7 +37,58 @@ The pipeline automates the following 8 steps dynamically based on the selected m
 * **Linux**: Recommended for ISCE2 compatibility.
 * **wget**: Used for robust file downloading.
 * **Python Dependencies**: `pip install numpy matplotlib requests gdal`
-* **NASA Earthdata Credentials**: You must have a `~/.netrc` file configured with your NASA Earthdata login to download SLCs and Orbits from ASF. (`chmod 600 ~/.netrc`).
+* **Data Access Credentials**: ASF downloads require NASA Earthdata credentials; Copernicus downloads require Copernicus Data Space Ecosystem (CDSE) credentials. See the credential setup below.
+
+### Data Access Credential Setup
+
+autoInSAR supports two SLC data sources:
+
+* **ASF** (`--data_source asf`, default): recommended for most standard Sentinel-1 workflows.
+* **Copernicus Data Space Ecosystem** (`--data_source copernicus`): useful when the newest products, such as recent Sentinel-1D scenes, are available from Copernicus before they appear on ASF.
+
+**ASF / NASA Earthdata (`~/.netrc`)**
+
+Create or edit `~/.netrc`:
+
+```bash
+nano ~/.netrc
+```
+
+Add your NASA Earthdata credentials using this format:
+
+```text
+machine urs.earthdata.nasa.gov login YOUR_EARTHDATA_USERNAME password YOUR_EARTHDATA_PASSWORD
+```
+
+Then restrict file permissions:
+
+```bash
+chmod 600 ~/.netrc
+```
+
+**Copernicus / CDSE (`~/.cdse_credentials`)**
+
+Create or edit `~/.cdse_credentials`:
+
+```bash
+nano ~/.cdse_credentials
+```
+
+Add your Copernicus Data Space Ecosystem credentials using this format:
+
+```text
+username=YOUR_COPERNICUS_USERNAME
+password=YOUR_COPERNICUS_PASSWORD
+```
+
+Then restrict file permissions:
+
+```bash
+chmod 600 ~/.cdse_credentials
+```
+
+Do not commit real usernames or passwords to GitHub. The credential examples above are templates only.
+
 
 ## 4. Installation & Environment Setup
 **1. Clone the Repository & Make the Script Executable**
@@ -84,6 +135,12 @@ python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --reference_date 20251113 
 python autoInSAR.py --mode stack --lon 40.7 --lat 13.6 --start_date 20200101 --end_date 20231231 --rel_orbit 14
 ```
 
+**4. Copernicus Data Source:** Use Copernicus Data Space Ecosystem instead of ASF, which can be useful for newly available products such as recent Sentinel-1D SLCs.
+
+```bash
+python autoInSAR.py --data_source copernicus --mode stack --lon -67.9 --lat 10.5 --start_date 20260610 --end_date 20260627 --rel_orbit 106 --platform S1D
+```
+
 ### [General] Running Specific Steps
 You can run the pipeline step-by-step using the `--step` argument. Useful for debugging or re-running parts of the workflow.
 
@@ -98,6 +155,7 @@ python autoInSAR.py --mode stack --step clean
 | Argument           | Type   | Required | Description |
 | :---               | :---   | :---     | :--- |
 | `--mode`           | String | No       | Execution mode: `pair` or `stack`. (Default: `pair`) |
+| `--data_source`    | String | No       | SLC data source: `asf` or `copernicus`. (Default: `asf`). Use `copernicus` for CDSE products, including newly available Sentinel-1D scenes not yet mirrored by ASF. |
 | `--lon`            | Float  | Yes      | Center Longitude of the area of interest. |
 | `--lat`            | Float  | Yes      | Center Latitude of the area of interest. |
 | `--event_date`     | String | No* | *[Pair Mode]* Event date (YYYYMMDD). Auto-selects pair ±12 days. |

@@ -20,10 +20,10 @@ Description:
         evaluates the spatiotemporal baseline network, and auto-recommends StaMPS modes.
 
 Pipeline Steps (Dual-Track Logic):
-    1. Search   : Auto-query ASF API. 
+    1. Search   : Auto-query ASF or Copernicus API. 
                   - pair: Requires 2 dates (via --event_date or manual dates).
                   - stack: Requires a date range (--start_date to --end_date) and strict --rel_orbit.
-    2. Download : Automated sequential downloading of SLCs and ZIP integrity verification.
+    2. Download : Automated sequential downloading of SLCs from ASF/Copernicus and ZIP integrity verification.
     3. Orbit    : Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files.
     4. DEM      : Auto-download SRTMGL1 tiles and stitch them using ISCE's dem utilities.
     5. Config   : - pair: Auto-generates standard XMLs (tops.xml, reference.xml).
@@ -81,6 +81,8 @@ import json
 import requests
 import re
 import shutil
+import shlex
+import netrc as netrc_module
 import zipfile
 import glob
 import math
@@ -105,6 +107,11 @@ class AutoInSAR_Pipeline:
         self.args = args
         self.work_dir = os.getcwd()
         self.api_url = "https://api.daac.asf.alaska.edu/services/search/param"
+        self.data_source = args.data_source.lower()
+        self.copernicus_api_url = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+        self.copernicus_download_url = "https://download.dataspace.copernicus.eu/odata/v1/Products"
+        self.copernicus_token_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+        self._copernicus_token = None
         
         # Initialize basic variables (Updated for dual-mode)
         self.mode = args.mode
@@ -140,7 +147,7 @@ class AutoInSAR_Pipeline:
         self.slc_file_list = None
         self.slc_url_list = None
 
-    def run_command(self, cmd, quiet=False, exit_on_error=True):
+    def run_command(self, cmd, quiet=False, exit_on_error=True, display_cmd=None):
         """Generic command executor.
 
         Parameters
@@ -153,16 +160,21 @@ class AutoInSAR_Pipeline:
             If True, keep the historical behavior and exit on command failure.
             If False, return False on command failure so the caller can continue
             batch operations such as SLC downloads.
+        display_cmd : str or None
+            Optional redacted command string for console logging. The original
+            command is still executed, but display_cmd is printed instead. This
+            is useful when a command contains authentication tokens.
         """
+        shown_cmd = display_cmd if display_cmd is not None else cmd
         if not quiet:
-            print(f"\n[Exec]: {cmd}")
+            print(f"\n[Exec]: {shown_cmd}")
         
         try:
             out_stream = subprocess.DEVNULL if quiet else None
             subprocess.run(cmd, shell=True, check=True, stdout=out_stream, stderr=out_stream)
             return True
         except subprocess.CalledProcessError:
-            print(f"[!] Error executing command: {cmd}")
+            print(f"[!] Error executing command: {shown_cmd}")
             if exit_on_error:
                 sys.exit(1)
             return False
@@ -172,8 +184,11 @@ class AutoInSAR_Pipeline:
     # --------------------------------------------------------------------------
     def step_1_search_data(self):
         print("\n" + "="*50)
-        print(">>> Step 1: Searching SLC Data from ASF")
+        print(f">>> Step 1: Searching SLC Data from {self.data_source.upper()}")
         print("="*50)
+
+        if self.data_source == "copernicus":
+            return self._step_1_search_copernicus_data()
 
         d = self.args.dlonlat
         min_lon = self.lon - d
@@ -429,6 +444,493 @@ class AutoInSAR_Pipeline:
         
         print("[*] Step 1 Search completed.")
 
+
+    def _platform_to_copernicus_short(self):
+        """Return Copernicus platform short name (S1A/S1B/S1C/S1D/S1)."""
+        platform_short_map = {
+            "Sentinel-1": "S1",
+            "Sentinel-1A": "S1A",
+            "Sentinel-1B": "S1B",
+            "Sentinel-1C": "S1C",
+            "Sentinel-1D": "S1D",
+            "S1": "S1",
+            "S1A": "S1A",
+            "S1B": "S1B",
+            "S1C": "S1C",
+            "S1D": "S1D",
+        }
+        return platform_short_map.get(self.args.platform, "S1")
+
+    def _extract_copernicus_attribute(self, product, name, default=None):
+        """Extract a named OData attribute from a Copernicus product."""
+        for att in product.get("Attributes", []) or []:
+            if att.get("Name") == name:
+                return att.get("Value", default)
+        return default
+
+    def _iter_geojson_coords(self, obj):
+        """Yield (lon, lat) pairs from a nested GeoJSON coordinate object."""
+        if isinstance(obj, (list, tuple)):
+            if len(obj) >= 2 and all(isinstance(x, (int, float)) for x in obj[:2]):
+                yield float(obj[0]), float(obj[1])
+            else:
+                for item in obj:
+                    yield from self._iter_geojson_coords(item)
+
+    def _step_1_search_copernicus_data(self):
+        """Search Sentinel-1 SLC data from Copernicus Data Space OData API.
+
+        The generated list_*.txt and url_*.txt files follow the same convention
+        used by the ASF workflow so Step 2 can download from either source.
+        """
+        d = self.args.dlonlat
+        min_lon = self.lon - d
+        min_lat = self.lat - d
+        max_lon = self.lon + d
+        max_lat = self.lat + d
+        bbox = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}"
+        print(f"[*] Bbox set to: {bbox} (Center: {self.lon}, {self.lat}, Buffer: {d})")
+
+        query_time_ranges = []
+        if self.mode == 'pair':
+            if self.reference_date and self.secondary_date:
+                try:
+                    dt_s = datetime.strptime(self.reference_date, "%Y%m%d")
+                    dt_e = datetime.strptime(self.secondary_date, "%Y%m%d")
+                except ValueError:
+                    print("[!] Error: Date format must be YYYYMMDD")
+                    sys.exit(1)
+
+                print(f"[*] Date Mode: Manual Pair Selection")
+                print(f"    - Date 1: {dt_s.date()}")
+                print(f"    - Date 2: {dt_e.date()}")
+
+                q1_start = dt_s.strftime("%Y-%m-%dT00:00:00.000Z")
+                q1_end = dt_s.strftime("%Y-%m-%dT23:59:59.999Z")
+                query_time_ranges.append((q1_start, q1_end))
+
+                q2_start = dt_e.strftime("%Y-%m-%dT00:00:00.000Z")
+                q2_end = dt_e.strftime("%Y-%m-%dT23:59:59.999Z")
+                query_time_ranges.append((q2_start, q2_end))
+
+            elif self.eq_date:
+                try:
+                    eq_dt = datetime.strptime(self.eq_date, "%Y%m%d")
+                except ValueError:
+                    print("[!] Error: Date format must be YYYYMMDD")
+                    sys.exit(1)
+
+                dt_start = eq_dt - timedelta(days=12)
+                dt_end = eq_dt + timedelta(days=12)
+                t_start = dt_start.strftime("%Y-%m-%dT00:00:00.000Z")
+                t_end = dt_end.strftime("%Y-%m-%dT23:59:59.999Z")
+                print(f"[*] Date Mode: Earthquake Event ({eq_dt.date()}) -> Auto Range: {dt_start.date()} to {dt_end.date()}")
+                query_time_ranges.append((t_start, t_end))
+
+        elif self.mode == 'stack':
+            try:
+                dt_start = datetime.strptime(self.start_date, "%Y%m%d")
+                dt_end = datetime.strptime(self.end_date, "%Y%m%d")
+            except ValueError:
+                print("[!] Error: Date format must be YYYYMMDD")
+                sys.exit(1)
+
+            t_start = dt_start.strftime("%Y-%m-%dT00:00:00.000Z")
+            t_end = dt_end.strftime("%Y-%m-%dT23:59:59.999Z")
+            print(f"[*] Date Mode: Time-Series Stack")
+            print(f"    - Start Date: {dt_start.date()}")
+            print(f"    - End Date  : {dt_end.date()}")
+            query_time_ranges.append((t_start, t_end))
+
+        # Copernicus OData geographic filters use lon/lat coordinates and require
+        # a closed polygon.
+        polygon = (
+            f"POLYGON(({min_lon:.6f} {min_lat:.6f},"
+            f"{max_lon:.6f} {min_lat:.6f},"
+            f"{max_lon:.6f} {max_lat:.6f},"
+            f"{min_lon:.6f} {max_lat:.6f},"
+            f"{min_lon:.6f} {min_lat:.6f}))"
+        )
+
+        platform_short = self._platform_to_copernicus_short()
+        all_results = []
+        print(f"[*] Querying Copernicus OData API ({len(query_time_ranges)} request(s))...")
+
+        for idx, (t_start, t_end) in enumerate(query_time_ranges):
+            filters = [
+                "Collection/Name eq 'SENTINEL-1'",
+                "Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq 'IW_SLC__1S')",
+                f"ContentDate/Start gt {t_start}",
+                f"ContentDate/Start lt {t_end}",
+                f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')",
+            ]
+
+            if platform_short != "S1":
+                filters.append(
+                    "Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'platformShortName' "
+                    f"and att/OData.CSC.StringAttribute/Value eq '{platform_short}')"
+                )
+
+            if self.rel_orbit:
+                filters.append(
+                    "Attributes/OData.CSC.IntegerAttribute/any(att:att/Name eq 'relativeOrbitNumber' "
+                    f"and att/OData.CSC.IntegerAttribute/Value eq {self.rel_orbit})"
+                )
+
+            filter_str = " and ".join(filters)
+            skip = 0
+            top = 1000
+            while True:
+                params = {
+                    "$filter": filter_str,
+                    "$orderby": "ContentDate/Start asc",
+                    "$top": top,
+                    "$skip": skip,
+                    "$expand": "Attributes",
+                }
+
+                try:
+                    if len(query_time_ranges) > 1 and skip == 0:
+                        print(f"    Running query {idx+1}/{len(query_time_ranges)} for range {t_start[:10]}...")
+                    response = requests.get(self.copernicus_api_url, params=params, timeout=90)
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as e:
+                    print(f"[!] Copernicus API request failed for range {t_start}: {e}")
+                    break
+
+                batch = data.get("value", [])
+                if not batch:
+                    break
+                all_results.extend(batch)
+
+                # Stop if fewer than top records were returned and no nextLink exists.
+                if len(batch) < top and "@odata.nextLink" not in data:
+                    break
+                skip += top
+
+        unique_results = {}
+        for item in all_results:
+            key = item.get("Name") or item.get("Id")
+            unique_results[key] = item
+        results_list = list(unique_results.values())
+
+        if not results_list:
+            print("[!] No Copernicus results found.")
+            sys.exit(0)
+
+        print(f"[*] Found {len(results_list)} Copernicus scenes total (merged).")
+
+        orbit_map = {}
+        for item in results_list:
+            orb = self._extract_copernicus_attribute(item, "relativeOrbitNumber")
+            direction = self._extract_copernicus_attribute(item, "orbitDirection", "UNKNOWN")
+            if orb is not None:
+                orbit_map[int(orb)] = direction
+
+        found_orbits = sorted(list(orbit_map.keys()))
+        if not found_orbits:
+            print("[!] Error: Could not extract relativeOrbitNumber from Copernicus product attributes.")
+            sys.exit(1)
+
+        if self.rel_orbit:
+            self.target_orbit = self.rel_orbit
+            final_results = [
+                x for x in results_list
+                if int(self._extract_copernicus_attribute(x, "relativeOrbitNumber", -1)) == self.target_orbit
+            ]
+        else:
+            if len(found_orbits) == 1:
+                self.target_orbit = found_orbits[0]
+                direction = orbit_map[self.target_orbit]
+                print(f"[*] Single orbit detected: {self.target_orbit} ({direction}). Proceeding automatically.")
+                final_results = results_list
+            else:
+                print(f"\n[!] ERROR: Multiple overlapping orbits found: {found_orbits}")
+                print("    InSAR processing (both Pair and Stack modes) MUST be conducted on a SINGLE relative orbit.")
+                print("    Please analyze which orbit fits your study area best and run again with --rel_orbit <number>")
+                for orb in found_orbits:
+                    cnt = sum(1 for x in results_list if int(self._extract_copernicus_attribute(x, "relativeOrbitNumber", -1)) == orb)
+                    direction = orbit_map.get(orb, 'UNKNOWN')
+                    print(f"    - Orbit {orb} ({direction}): {cnt} scenes")
+                sys.exit(0)
+
+        unique_dates = sorted(list(set([
+            (item.get("ContentDate", {}) or {}).get("Start", "Unknown")[:10]
+            for item in final_results
+        ])))
+
+        if self.mode == 'pair':
+            if len(unique_dates) > 2:
+                print("\n" + "!"*60)
+                print(f"[!] AMBIGUITY ERROR: Found {len(unique_dates)} unique dates in the search window.")
+                print(f"    Dates Found: {', '.join(unique_dates)}")
+                print("-" * 60)
+                print("    Standard D-InSAR ('pair' mode) requires exactly ONE pair (2 dates).")
+                print("    Your search captured too many revisit cycles.")
+                print("\n    >>> SOLUTIONS:")
+                print("    1. Use manual pair selection (--reference_date / --secondary_date)")
+                print("    2. If you intend to do Time-Series, switch to --mode stack")
+                print("!"*60 + "\n")
+                sys.exit(0)
+
+            if len(unique_dates) < 2:
+                print(f"[!] Error: Found only {len(unique_dates)} date ({unique_dates}). InSAR requires a pair.")
+                sys.exit(0)
+
+        elif self.mode == 'stack':
+            if len(unique_dates) < 2:
+                print(f"[!] Error: Found only {len(unique_dates)} date ({unique_dates}). Stack mode requires at least 2 dates.")
+                sys.exit(0)
+
+        final_results.sort(key=lambda x: (x.get("ContentDate", {}) or {}).get("Start", ""))
+
+        platform_tag = self.args.platform.replace("Sentinel-", "S") if self.args.platform.startswith("Sentinel-") else self.args.platform
+        list_filename = f"list_copernicus_{platform_tag}_{self.target_orbit}.txt"
+        url_filename = f"url_copernicus_{platform_tag}_{self.target_orbit}.txt"
+
+        total_size_gb = 0.0
+        with open(list_filename, "w") as f_list, open(url_filename, "w") as f_url:
+            for item in final_results:
+                name = item.get("Name", "")
+                if name.endswith(".SAFE"):
+                    scene_name = name[:-5]
+                elif name.endswith(".zip"):
+                    scene_name = name[:-4]
+                else:
+                    scene_name = name
+
+                product_id = item.get("Id")
+                if not scene_name or not product_id:
+                    continue
+
+                # Use $zip to request Sentinel-1 native-format compressed products.
+                download_url = f"{self.copernicus_download_url}({product_id})/$zip"
+                f_list.write(f"{scene_name}\n")
+                f_url.write(f"{download_url}\n")
+
+                size_bytes = item.get("ContentLength") or item.get("ContentLengthByte") or 0
+                try:
+                    total_size_gb += float(size_bytes) / (1024**3)
+                except Exception:
+                    pass
+
+        min_lon_f, max_lon_f = float('inf'), float('-inf')
+        min_lat_f, max_lat_f = float('inf'), float('-inf')
+        for item in final_results:
+            geo = item.get("GeoFootprint")
+            for lon, lat in self._iter_geojson_coords(geo.get("coordinates", []) if isinstance(geo, dict) else geo):
+                min_lon_f = min(min_lon_f, lon)
+                max_lon_f = max(max_lon_f, lon)
+                min_lat_f = min(min_lat_f, lat)
+                max_lat_f = max(max_lat_f, lat)
+
+        extent_filename = "extent.txt"
+        if min_lon_f != float('inf'):
+            with open(extent_filename, "w") as f_ext:
+                f_ext.write(f"{min_lat_f}\n")
+                f_ext.write(f"{max_lat_f}\n")
+                f_ext.write(f"{min_lon_f}\n")
+                f_ext.write(f"{max_lon_f}\n")
+            print(f"[*] Extent saved to {extent_filename}: Lat [{min_lat_f}, {max_lat_f}], Lon [{min_lon_f}, {max_lon_f}]")
+        else:
+            # Fall back to the requested search box so DEM/config steps can continue.
+            with open(extent_filename, "w") as f_ext:
+                f_ext.write(f"{min_lat}\n")
+                f_ext.write(f"{max_lat}\n")
+                f_ext.write(f"{min_lon}\n")
+                f_ext.write(f"{max_lon}\n")
+            print(f"[!] Warning: Could not parse Copernicus GeoFootprint. Search bbox saved to {extent_filename}.")
+
+        display_dates = sorted(list(set(unique_dates)))
+        target_dir = orbit_map.get(self.target_orbit, 'UNKNOWN')
+        print(f"\n[*] Search complete for {self.mode.upper()} mode using COPERNICUS.")
+        print(f"    - Target Orbit: {self.target_orbit} ({target_dir})")
+        print(f"    - Total Scenes: {len(final_results)}")
+        print(f"    - Unique Dates: {len(display_dates)}")
+        print(f"    - Date List   : {', '.join(display_dates)}")
+        print(f"    - Total Size  : {total_size_gb:.2f} GB")
+        print(f"    - File List saved to: {list_filename}")
+        print(f"    - URL List saved to: {url_filename}")
+        print(f"    - Extent File saved to: {extent_filename}")
+
+        self.slc_file_list = list_filename
+        self.slc_url_list = url_filename
+        print("[*] Step 1 Copernicus Search completed.")
+
+    def _read_simple_credentials_file(self, path):
+        """Read a small key=value credential file without printing secrets.
+
+        Supported keys:
+            username=...
+            password=...
+            totp=...          # optional, only for accounts using 2FA
+            access_token=...  # optional, bypasses username/password token request
+        """
+        creds = {}
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            return creds
+
+        try:
+            mode = os.stat(path).st_mode
+            if mode & 0o077:
+                print(f"[!] Warning: Credential file {path} is readable by group/others. Consider: chmod 600 {path}")
+
+            with open(path, "r") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip().lower()
+                    value = value.strip().strip('"').strip("'")
+                    if key in {"username", "user", "login"}:
+                        creds["username"] = value
+                    elif key in {"password", "passwd"}:
+                        creds["password"] = value
+                    elif key in {"totp", "otp", "2fa"}:
+                        creds["totp"] = value
+                    elif key in {"access_token", "token"}:
+                        creds["access_token"] = value
+        except Exception as e:
+            print(f"[!] Warning: Failed to read credential file {path}: {e}")
+
+        return creds
+
+    def _get_copernicus_credentials_from_files(self):
+        """Return CDSE credentials from ~/.cdse_credentials, ~/.copernicus_credentials, or ~/.netrc."""
+        # 1) Simple key=value files. An explicit env path has highest priority.
+        candidate_files = []
+        explicit = os.environ.get("CDSE_CREDENTIALS_FILE") or os.environ.get("COPERNICUS_CREDENTIALS_FILE")
+        if explicit:
+            candidate_files.append(explicit)
+        candidate_files.extend([
+            "~/.cdse_credentials",
+            "~/.copernicus_credentials",
+        ])
+
+        seen = set()
+        for path in candidate_files:
+            expanded = os.path.expanduser(path)
+            if expanded in seen:
+                continue
+            seen.add(expanded)
+            creds = self._read_simple_credentials_file(expanded)
+            if creds:
+                creds["source"] = expanded
+                return creds
+
+        # 2) Optional ~/.netrc support, similar in spirit to ASF/Earthdata.
+        # Example:
+        #   machine identity.dataspace.copernicus.eu login YOUR_USER password YOUR_PASSWORD
+        # or:
+        #   machine dataspace.copernicus.eu login YOUR_USER password YOUR_PASSWORD
+        netrc_path = os.path.expanduser("~/.netrc")
+        if os.path.exists(netrc_path):
+            try:
+                auths = netrc_module.netrc(netrc_path)
+                for host in [
+                    "identity.dataspace.copernicus.eu",
+                    "dataspace.copernicus.eu",
+                    "catalogue.dataspace.copernicus.eu",
+                    "download.dataspace.copernicus.eu",
+                    "cdse",
+                    "copernicus",
+                ]:
+                    auth = auths.authenticators(host)
+                    if auth:
+                        login, account, password = auth
+                        username = login or account
+                        if username and password:
+                            return {
+                                "username": username,
+                                "password": password,
+                                "source": f"{netrc_path} ({host})",
+                            }
+            except Exception as e:
+                print(f"[!] Warning: Failed to read Copernicus credentials from ~/.netrc: {e}")
+
+        return {}
+
+    def _get_copernicus_access_token(self):
+        """Return a CDSE access token.
+
+        Priority:
+            1. CDSE_ACCESS_TOKEN / COPERNICUS_ACCESS_TOKEN
+            2. access_token in ~/.cdse_credentials or ~/.copernicus_credentials
+            3. username/password from environment variables
+            4. username/password from ~/.cdse_credentials or ~/.copernicus_credentials
+            5. username/password from ~/.netrc
+        """
+        if self._copernicus_token:
+            return self._copernicus_token
+
+        token = os.environ.get("CDSE_ACCESS_TOKEN") or os.environ.get("COPERNICUS_ACCESS_TOKEN")
+        if token:
+            self._copernicus_token = token
+            return token
+
+        file_creds = self._get_copernicus_credentials_from_files()
+        token = file_creds.get("access_token")
+        if token:
+            print(f"[*] Using Copernicus access token from {file_creds.get('source', 'credential file')}")
+            self._copernicus_token = token
+            return token
+
+        username = os.environ.get("CDSE_USERNAME") or os.environ.get("COPERNICUS_USERNAME")
+        password = os.environ.get("CDSE_PASSWORD") or os.environ.get("COPERNICUS_PASSWORD")
+        totp = os.environ.get("CDSE_TOTP") or os.environ.get("COPERNICUS_TOTP")
+        cred_source = "environment variables"
+
+        if not username or not password:
+            username = file_creds.get("username")
+            password = file_creds.get("password")
+            totp = totp or file_creds.get("totp")
+            cred_source = file_creds.get("source", "credential file")
+
+        if not username or not password:
+            sys.exit(
+                "[!] Error: Copernicus download requires credentials. Provide one of the following:\n"
+                "    1) Export CDSE_USERNAME and CDSE_PASSWORD, or\n"
+                "    2) Create ~/.cdse_credentials with username=... and password=..., or\n"
+                "    3) Add a ~/.netrc entry for identity.dataspace.copernicus.eu.\n"
+                "    Optional 2FA: set CDSE_TOTP or add totp=... to ~/.cdse_credentials."
+            )
+
+        print(f"[*] Requesting Copernicus access token using credentials from {cred_source}")
+
+        payload = {
+            "client_id": "cdse-public",
+            "username": username,
+            "password": password,
+            "grant_type": "password",
+        }
+        if totp:
+            payload["totp"] = totp
+
+        try:
+            response = requests.post(self.copernicus_token_url, data=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            detail = ""
+            try:
+                detail = f"\n    Response: {response.text[:500]}"
+            except Exception:
+                pass
+            sys.exit(f"[!] Error: Failed to obtain Copernicus access token: {e}{detail}")
+
+        access_token = data.get("access_token")
+        if not access_token:
+            sys.exit("[!] Error: Copernicus token response did not contain access_token.")
+
+        self._copernicus_token = access_token
+        return access_token
+
     # --------------------------------------------------------------------------
     # Step 2: SLC Download
     # --------------------------------------------------------------------------
@@ -438,8 +940,13 @@ class AutoInSAR_Pipeline:
         print("="*50)
         
         # Check Credentials
-        if not os.path.exists(os.path.expanduser("~/.netrc")):
-            sys.exit("[!] Error: ~/.netrc missing. Please configure NASA Earthdata credentials.")
+        copernicus_token = None
+        if self.data_source == "asf":
+            if not os.path.exists(os.path.expanduser("~/.netrc")):
+                sys.exit("[!] Error: ~/.netrc missing. Please configure NASA Earthdata credentials.")
+        elif self.data_source == "copernicus":
+            copernicus_token = self._get_copernicus_access_token()
+            print("[*] Copernicus access token acquired from environment/configuration.")
 
         if not self.slc_file_list:
             detected_list = self._auto_detect_list_file()
@@ -546,11 +1053,30 @@ class AutoInSAR_Pipeline:
                     shutil.move(target_path, os.path.join(unused_dir, fname))
 
             # Download SLC files
-            # ASF datapool may occasionally present an expired TLS certificate.
-            # Use --no-check-certificate to keep large automated downloads running,
-            # and --auth-no-challenge=on for NASA Earthdata/ASF authentication redirects.
-            cmd = f"wget -c --no-check-certificate --auth-no-challenge=on -q --show-progress -O {target_path} {url}"
-            if not self.run_command(cmd, exit_on_error=False):
+            if self.data_source == "copernicus":
+                if not copernicus_token:
+                    copernicus_token = self._get_copernicus_access_token()
+                cmd = (
+                    f"wget -c --trust-server-names -q --show-progress "
+                    f"--header={shlex.quote('Authorization: Bearer ' + copernicus_token)} "
+                    f"-O {shlex.quote(target_path)} {shlex.quote(url)}"
+                )
+                display_cmd = (
+                    f"wget -c --trust-server-names -q --show-progress "
+                    f"--header='Authorization: Bearer <REDACTED>' "
+                    f"-O {shlex.quote(target_path)} {shlex.quote(url)}"
+                )
+            else:
+                # ASF datapool may occasionally present an expired TLS certificate.
+                # Use --no-check-certificate to keep large automated downloads running,
+                # and --auth-no-challenge=on for NASA Earthdata/ASF authentication redirects.
+                cmd = (
+                    f"wget -c --no-check-certificate --auth-no-challenge=on -q --show-progress "
+                    f"-O {shlex.quote(target_path)} {shlex.quote(url)}"
+                )
+                display_cmd = cmd
+
+            if not self.run_command(cmd, exit_on_error=False, display_cmd=display_cmd):
                 log(f"Download Error for {fname}; continuing with next file.")
                 continue
 
@@ -1789,6 +2315,14 @@ class AutoInSAR_Pipeline:
         cands = glob.glob("list_*.txt")
         if not cands:
             return None
+
+        # Prefer list files from the active data source when available.
+        if getattr(self, "data_source", "asf") == "copernicus":
+            source_cands = [f for f in cands if "copernicus" in os.path.basename(f).lower()]
+        else:
+            source_cands = [f for f in cands if "copernicus" not in os.path.basename(f).lower()]
+        if source_cands:
+            cands = source_cands
             
         # orbit number
         if self.rel_orbit:
@@ -1816,6 +2350,8 @@ def main():
     # Mode Selection
     parser.add_argument("--mode", type=str, default="pair", choices=["pair", "stack"],
                         help="Processing mode: 'pair' for D-InSAR, 'stack' for Time-Series (Default: pair)")
+    parser.add_argument("--data_source", type=str, default="asf", choices=["asf", "copernicus"],
+                        help="SLC search/download source: 'asf' (default) or 'copernicus'. Copernicus uses CDSE OData; downloads use a token from env vars, ~/.cdse_credentials, ~/.copernicus_credentials, or ~/.netrc.")
     
     # Coordinates
     parser.add_argument("--lon", type=float, help="Center Longitude of the area of interest")
@@ -1879,6 +2415,7 @@ def main():
     print("\n" + "#"*60)
     print(f"[*] AutoInSAR Pipeline Started at: {start_str}")
     print(f"[*] Execution Mode : {args.mode.upper()}")
+    print(f"[*] Data Source    : {args.data_source.upper()}")
     print(f"[*] Execution Step : '{args.step}'")
     print("#"*60)
     
