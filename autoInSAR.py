@@ -140,17 +140,32 @@ class AutoInSAR_Pipeline:
         self.slc_file_list = None
         self.slc_url_list = None
 
-    def run_command(self, cmd, quiet=False):
-        """Generic command executor."""
+    def run_command(self, cmd, quiet=False, exit_on_error=True):
+        """Generic command executor.
+
+        Parameters
+        ----------
+        cmd : str
+            Shell command to execute.
+        quiet : bool
+            If True, suppress stdout/stderr from the subprocess.
+        exit_on_error : bool
+            If True, keep the historical behavior and exit on command failure.
+            If False, return False on command failure so the caller can continue
+            batch operations such as SLC downloads.
+        """
         if not quiet:
             print(f"\n[Exec]: {cmd}")
         
         try:
             out_stream = subprocess.DEVNULL if quiet else None
             subprocess.run(cmd, shell=True, check=True, stdout=out_stream, stderr=out_stream)
+            return True
         except subprocess.CalledProcessError:
             print(f"[!] Error executing command: {cmd}")
-            sys.exit(1)
+            if exit_on_error:
+                sys.exit(1)
+            return False
 
     # --------------------------------------------------------------------------
     # Step 1: SLC Data Search
@@ -448,13 +463,50 @@ class AutoInSAR_Pipeline:
         
         log_file = os.path.join(slc_dir, "download.log")
 
-        # ZIP Verification 
+        # ZIP Verification
+        # Fast central-directory validation is used by default. This is much
+        # faster than a full CRC scan (ZipFile.testzip) for multi-GB Sentinel-1
+        # SLC archives while still catching the common interrupted-download case
+        # where the ZIP central directory is missing or incomplete.
+        zip_check_backend = getattr(self.args, "zip_check_backend", "auto")
+        zipinfo_cmd = shutil.which("zipinfo")
+
+        if zip_check_backend == "zipinfo" and not zipinfo_cmd:
+            print("[!] Warning: --zip_check_backend zipinfo requested, but 'zipinfo' was not found. Falling back to Python zipfile.")
+
+        if zip_check_backend == "auto":
+            active_zip_checker = "zipinfo" if zipinfo_cmd else "python zipfile"
+        elif zip_check_backend == "zipinfo" and zipinfo_cmd:
+            active_zip_checker = "zipinfo"
+        else:
+            active_zip_checker = "python zipfile"
+        print(f"[*] ZIP check backend: {active_zip_checker} (fast central-directory check)")
+
         def is_valid_zip(path):
-            if not os.path.exists(path): return False
+            if not os.path.exists(path):
+                return False
+
+            # Preferred fast path: external zipinfo, if selected and available.
+            if active_zip_checker == "zipinfo":
+                try:
+                    result = subprocess.run(
+                        [zipinfo_cmd, "-1", path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False
+                    )
+                    return result.returncode == 0
+                except Exception:
+                    return False
+
+            # Pure-Python fallback: read the ZIP central directory only.
+            # Do not call ZipFile.testzip() here; it performs a full CRC scan and
+            # is too slow for hundreds of large Sentinel-1 SLC ZIP files.
             try:
-                if not zipfile.is_zipfile(path): return False
+                if not zipfile.is_zipfile(path):
+                    return False
                 with zipfile.ZipFile(path) as zf:
-                    return zf.testzip() is None
+                    return len(zf.infolist()) > 0
             except Exception:
                 return False
 
@@ -495,10 +547,8 @@ class AutoInSAR_Pipeline:
 
             # Download SLC files
             cmd = f"wget -c -q --show-progress -O {target_path} {url}"
-            try:
-                self.run_command(cmd)
-            except Exception as e:
-                log(f"Download Error for {fname}: {e}")
+            if not self.run_command(cmd, exit_on_error=False):
+                log(f"Download Error for {fname}; continuing with next file.")
                 continue
 
             # Post-Download Verification
@@ -1786,6 +1836,10 @@ def main():
     # Orbit
     parser.add_argument("--rel_orbit", type=int, help="Relative Orbit Number (Optional).")
     parser.add_argument("--dlonlat", type=float, default=0.2, help="Search buffer in degrees (Default: 0.2)")
+
+    # Download / ZIP verification
+    parser.add_argument("--zip_check_backend", type=str, default="auto", choices=["auto", "python", "zipinfo"],
+                        help="ZIP validation backend for Step 2: 'auto' uses zipinfo if available, otherwise Python zipfile; 'python' uses Python zipfile only; 'zipinfo' requests zipinfo with Python fallback. All modes use fast central-directory checks.")
     
     # Steps
     parser.add_argument("--step", type=str, default="all",

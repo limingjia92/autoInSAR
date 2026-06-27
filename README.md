@@ -108,6 +108,7 @@ python autoInSAR.py --mode stack --step clean
 | `--platform`       | String | No       | Satellite platform (Default: `S1`). |
 | `--rel_orbit`      | Int    | No*** | Specific Relative Orbit Number to filter results. |
 | `--dlonlat`        | Float  | No       | Search buffer size in degrees (Default: `0.2`). |
+| `--zip_check_backend` | String | No    | ZIP validation backend for Step 2: `auto`, `python`, or `zipinfo` (Default: `auto`). `auto` uses `zipinfo` if available, otherwise falls back to Python `zipfile`; all modes use fast central-directory checks. |
 | `--step`           | String | No       | Execution step (Default: `all`). |
 
 *\* Pair Mode requires either `--event_date` OR both `--reference_date` and `--secondary_date`.*
