@@ -546,7 +546,10 @@ class AutoInSAR_Pipeline:
                     shutil.move(target_path, os.path.join(unused_dir, fname))
 
             # Download SLC files
-            cmd = f"wget -c -q --show-progress -O {target_path} {url}"
+            # ASF datapool may occasionally present an expired TLS certificate.
+            # Use --no-check-certificate to keep large automated downloads running,
+            # and --auth-no-challenge=on for NASA Earthdata/ASF authentication redirects.
+            cmd = f"wget -c --no-check-certificate --auth-no-challenge=on -q --show-progress -O {target_path} {url}"
             if not self.run_command(cmd, exit_on_error=False):
                 log(f"Download Error for {fname}; continuing with next file.")
                 continue
