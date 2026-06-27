@@ -20,11 +20,11 @@ The pipeline operates in two distinct modes controlled by the `--mode` argument:
 
 The pipeline automates the following 8 steps dynamically based on the selected mode:
 
-1.  **Search**: Auto-query SLC images from ASF (default) or Copernicus Data Space Ecosystem. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks.
+1.  **Search**: Auto-query SLC images from ASF (default) or Copernicus Data Space Ecosystem. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks, with an independent search buffer controlled by `--search_dlonlat`.
 2.  **Download**: Sequential downloading of SLC data with ZIP integrity verification and auto-resume.
 3.  **Orbit**: Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files with robust time-window matching.
 4.  **DEM**: Auto-download and stitch SRTMGL1 DEM tiles covering the region of interest.
-5.  **Config**: Auto-generation of ISCE XML configs (`tops.xml`) OR sequential execution scripts (`run_01` to `run_13` for stack mode).
+5.  **Config**: Auto-generation of ISCE XML configs (`tops.xml`) OR sequential execution scripts (`run_01` to `run_13` for stack mode), with an independent processing ROI controlled by `--roi_dlonlat`.
 6.  **Process**: Execution of the standard `topsApp.py` workflow OR safe, sequential execution of the stack scripts.
 7.  **Post-Processing**: 
     * *(Pair)*: GDAL extraction, E/N/U decomposition, and Matplotlib 2D visualization.
@@ -141,6 +141,18 @@ python autoInSAR.py --mode stack --lon 40.7 --lat 13.6 --start_date 20200101 --e
 python autoInSAR.py --data_source copernicus --mode stack --lon -67.9 --lat 10.5 --start_date 20260610 --end_date 20260627 --rel_orbit 106 --platform S1D
 ```
 
+**5. Separate Search Buffer and Processing ROI:** Use a larger search buffer to ensure the correct SLCs are found, while keeping the actual ISCE processing region smaller.
+
+```bash
+python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --event_date 20251117 --search_dlonlat 0.5 --roi_dlonlat 0.2
+```
+
+**6. Full-Extent Processing:** Set `--roi_dlonlat 0` to disable ROI clipping in ISCE configuration and pair-mode post-processing. This processes the full available overlap of the selected scenes.
+
+```bash
+python autoInSAR.py --mode pair --lon 40.7 --lat 13.6 --event_date 20251117 --search_dlonlat 0.5 --roi_dlonlat 0
+```
+
 ### [General] Running Specific Steps
 You can run the pipeline step-by-step using the `--step` argument. Useful for debugging or re-running parts of the workflow.
 
@@ -165,13 +177,17 @@ python autoInSAR.py --mode stack --step clean
 | `--end_date`       | String | No** | *[Stack Mode]* End date for time-series search (YYYYMMDD). |
 | `--platform`       | String | No       | Satellite platform (Default: `S1`). |
 | `--rel_orbit`      | Int    | No*** | Specific Relative Orbit Number to filter results. |
-| `--dlonlat`        | Float  | No       | Search buffer size in degrees (Default: `0.2`). |
+| `--search_dlonlat` | Float  | No       | Search buffer size in degrees for ASF/Copernicus queries (Default: `0.2`). This controls which SLC scenes are searched and listed. |
+| `--roi_dlonlat`    | Float  | No       | Processing/cropping ROI half-width in degrees. By default it equals `--search_dlonlat`, preserving the legacy behavior. Set `--roi_dlonlat 0` to disable ROI clipping and process the full available scene overlap. |
+| `--dlonlat`        | Float  | No       | Deprecated compatibility alias for the old single-buffer behavior. Prefer `--search_dlonlat` and `--roi_dlonlat` for new runs. |
 | `--zip_check_backend` | String | No    | ZIP validation backend for Step 2: `auto`, `python`, or `zipinfo` (Default: `auto`). `auto` uses `zipinfo` if available, otherwise falls back to Python `zipfile`; all modes use fast central-directory checks. |
 | `--step`           | String | No       | Execution step (Default: `all`). |
 
 *\* Pair Mode requires either `--event_date` OR both `--reference_date` and `--secondary_date`.*
 *\*\* Stack Mode requires both `--start_date` and `--end_date`.*
 *\*\*\* Time-Series (Stack Mode) MUST be conducted on a SINGLE relative orbit. Specifying `--rel_orbit` is highly recommended.*
+
+**Search buffer vs. processing ROI:** `--search_dlonlat` controls the spatial buffer used for SLC search. `--roi_dlonlat` controls the ISCE processing ROI and pair-mode post-processing crop. If `--roi_dlonlat` is omitted, it follows `--search_dlonlat`. If `--roi_dlonlat 0` is used, the ROI line is omitted from `tops.xml`, the `-b` option is omitted from `stackSentinel.py`, and pair-mode post-processing keeps the full geocoded extent.
 
 ## 7. Output Structure
 

@@ -20,13 +20,13 @@ Description:
         evaluates the spatiotemporal baseline network, and auto-recommends StaMPS modes.
 
 Pipeline Steps (Dual-Track Logic):
-    1. Search   : Auto-query ASF or Copernicus API. 
+    1. Search   : Auto-query ASF or Copernicus API using --search_dlonlat. 
                   - pair: Requires 2 dates (via --event_date or manual dates).
                   - stack: Requires a date range (--start_date to --end_date) and strict --rel_orbit.
     2. Download : Automated sequential downloading of SLCs from ASF/Copernicus and ZIP integrity verification.
     3. Orbit    : Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files.
     4. DEM      : Auto-download SRTMGL1 tiles and stitch them using ISCE's dem utilities.
-    5. Config   : - pair: Auto-generates standard XMLs (tops.xml, reference.xml).
+    5. Config   : - pair: Auto-generates standard XMLs (tops.xml, reference.xml) using --roi_dlonlat.
                   - stack: Calls `stackSentinel.py` to map the network and generate `run_*` scripts.
     6. Process  : - pair: Executes the standard `topsApp.py` workflow.
                   - stack: Sequentially and safely executes the generated `run_01` to `run_13` scripts.
@@ -190,13 +190,13 @@ class AutoInSAR_Pipeline:
         if self.data_source == "copernicus":
             return self._step_1_search_copernicus_data()
 
-        d = self.args.dlonlat
+        d = self.args.search_dlonlat
         min_lon = self.lon - d
         min_lat = self.lat - d
         max_lon = self.lon + d
         max_lat = self.lat + d
-        bbox = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}" # Build Bbox
-        print(f"[*] Bbox set to: {bbox} (Center: {self.lon}, {self.lat}, Buffer: {d})")
+        bbox = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}" # Build search bbox
+        print(f"[*] Search bbox set to: {bbox} (Center: {self.lon}, {self.lat}, Search Buffer: {d})")
 
         query_time_ranges = []
 
@@ -483,13 +483,13 @@ class AutoInSAR_Pipeline:
         The generated list_*.txt and url_*.txt files follow the same convention
         used by the ASF workflow so Step 2 can download from either source.
         """
-        d = self.args.dlonlat
+        d = self.args.search_dlonlat
         min_lon = self.lon - d
         min_lat = self.lat - d
         max_lon = self.lon + d
         max_lat = self.lat + d
         bbox = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}"
-        print(f"[*] Bbox set to: {bbox} (Center: {self.lon}, {self.lat}, Buffer: {d})")
+        print(f"[*] Search bbox set to: {bbox} (Center: {self.lon}, {self.lat}, Search Buffer: {d})")
 
         query_time_ranges = []
         if self.mode == 'pair':
@@ -1269,13 +1269,21 @@ class AutoInSAR_Pipeline:
         process_dir = os.path.join(self.work_dir, "process")
         os.makedirs(process_dir, exist_ok=True)
 
-        # 1. Bounding Box Calculation (Shared for both modes)
-        # In main(), --lon and --lat are strictly required, so this is safe.
-        d = self.args.dlonlat
-        min_lat = self.lat - d
-        max_lat = self.lat + d
-        min_lon = self.lon - d
-        max_lon = self.lon + d
+        # 1. ROI Bounding Box Calculation (Shared for both modes)
+        # --roi_dlonlat controls the ISCE processing/cropping ROI.
+        # If --roi_dlonlat 0 is used, no explicit ROI is passed to ISCE and
+        # post-processing keeps the full geocoded output extent.
+        roi_d = self.args.roi_dlonlat
+        use_full_roi = (roi_d == 0)
+        if use_full_roi:
+            min_lat = max_lat = min_lon = max_lon = None
+            print("[*] ROI mode: full scene coverage (--roi_dlonlat 0). No explicit ROI will be applied.")
+        else:
+            min_lat = self.lat - roi_d
+            max_lat = self.lat + roi_d
+            min_lon = self.lon - roi_d
+            max_lon = self.lon + roi_d
+            print(f"[*] ROI bbox set to: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}] (ROI Buffer: {roi_d})")
         
         # 2. Auto-detect DEM file (Shared for both modes)
         dem_candidates = glob.glob(os.path.join(self.work_dir, "DEM", "*.dem.wgs84"))
@@ -1354,8 +1362,14 @@ class AutoInSAR_Pipeline:
             with open(os.path.join(process_dir, "secondary.xml"), "w") as f:
                 f.write(sec_xml)
 
-            roi_string = f"[{min_lat:.4f}, {max_lat:.4f}, {min_lon:.4f}, {max_lon:.4f}]"
-            print(f"[*] Region of Interest set to: {roi_string}")
+            if use_full_roi:
+                roi_string = None
+                roi_property = ""
+                print("[*] Region of Interest disabled for pair mode; topsApp.py will process the full available overlap.")
+            else:
+                roi_string = f"[{min_lat:.4f}, {max_lat:.4f}, {min_lon:.4f}, {max_lon:.4f}]"
+                roi_property = f"        <property name=\"region of interest\">{roi_string}</property>\n"
+                print(f"[*] Region of Interest set to: {roi_string}")
 
             # Write tops.xml
             tops_xml = f"""<topsApp>
@@ -1371,8 +1385,7 @@ class AutoInSAR_Pipeline:
         <property name="swaths">[1,2,3]</property>
         <property name="range looks">20</property>
         <property name="azimuth looks">5</property>
-        <property name="region of interest">{roi_string}</property>
-        <property name="do unwrap">True</property>
+{roi_property}        <property name="do unwrap">True</property>
         <property name="unwrapper name">snaphu_mcf</property>
         <property name="do denseoffsets">True</property>
         <property name="do ESD">True</property>
@@ -1394,9 +1407,17 @@ class AutoInSAR_Pipeline:
             aux_dir = os.path.join(self.work_dir, "AUX")
             os.makedirs(aux_dir, exist_ok=True)
             
-            # Bounding Box format for stackSentinel: 'minLat maxLat minLon maxLon'
-            bbox_str = f"{min_lat:.4f} {max_lat:.4f} {min_lon:.4f} {max_lon:.4f}"
-            print(f"[*] Stack Bounding Box (S N W E): '{bbox_str}'")
+            # Bounding Box format for stackSentinel: 'minLat maxLat minLon maxLon'.
+            # If --roi_dlonlat 0 is used, omit -b so stackSentinel uses the full
+            # available scene overlap. This can be much larger and more expensive.
+            if use_full_roi:
+                bbox_str = None
+                bbox_option = ""
+                print("[*] Stack ROI disabled; stackSentinel.py will run without -b.")
+            else:
+                bbox_str = f"{min_lat:.4f} {max_lat:.4f} {min_lon:.4f} {max_lon:.4f}"
+                bbox_option = f" -b '{bbox_str}'"
+                print(f"[*] Stack Bounding Box (S N W E): '{bbox_str}'")
             
             # Construct command. 
             # Note: The script runs INSIDE 'process/', so directories are '../'
@@ -1407,8 +1428,8 @@ class AutoInSAR_Pipeline:
                 f"-a ../AUX/ "
                 f"-d ../DEM/{dem_name} "
                 f"-W slc "
-                f"-useGPU "
-                f"-b '{bbox_str}'"
+                f"-useGPU"
+                f"{bbox_option}"
             )
             
             cwd = os.getcwd()
@@ -1842,18 +1863,22 @@ class AutoInSAR_Pipeline:
         # Masking & Cropping (ROI)
         lons, lats, gt, proj = geo_info
         
-        if self.lat is not None and self.lon is not None:
-            d = self.args.dlonlat
-            min_lon_t, max_lon_t = self.lon - d, self.lon + d
-            min_lat_t, max_lat_t = self.lat - d, self.lat + d
+        roi_d = self.args.roi_dlonlat
+        if roi_d == 0:
+            x_start, x_end, y_start, y_end = 0, len(lons), 0, len(lats)
+            print("[*] Post-processing ROI crop disabled (--roi_dlonlat 0). Using full geocoded extent.")
+        elif self.lat is not None and self.lon is not None:
+            min_lon_t, max_lon_t = self.lon - roi_d, self.lon + roi_d
+            min_lat_t, max_lat_t = self.lat - roi_d, self.lat + roi_d
             x_idxs = np.where((lons >= min_lon_t) & (lons <= max_lon_t))[0]
             y_idxs = np.where((lats <= max_lat_t) & (lats >= min_lat_t))[0]
             
             if len(x_idxs) > 0 and len(y_idxs) > 0:
                 x_start, x_end = x_idxs[0], x_idxs[-1] + 1
                 y_start, y_end = y_idxs[0], y_idxs[-1] + 1
-                print(f"[*] Cropping to: Lon[{min_lon_t:.2f}, {max_lon_t:.2f}], Lat[{min_lat_t:.2f}, {max_lat_t:.2f}]")
+                print(f"[*] Cropping to ROI: Lon[{min_lon_t:.2f}, {max_lon_t:.2f}], Lat[{min_lat_t:.2f}, {max_lat_t:.2f}]")
             else:
+                print("[!] Warning: Requested ROI does not overlap geocoded grid. Falling back to full geocoded extent.")
                 x_start, x_end, y_start, y_end = 0, len(lons), 0, len(lats)
         else:
             x_start, x_end, y_start, y_end = 0, len(lons), 0, len(lats)
@@ -2372,9 +2397,14 @@ def main():
                                  "S1", "S1A", "S1B", "S1C", "S1D"],
                         help="Satellite Platform")
     
-    # Orbit
+    # Orbit / Spatial buffers
     parser.add_argument("--rel_orbit", type=int, help="Relative Orbit Number (Optional).")
-    parser.add_argument("--dlonlat", type=float, default=0.2, help="Search buffer in degrees (Default: 0.2)")
+    parser.add_argument("--search_dlonlat", type=float, default=None,
+                        help="Search buffer in degrees around --lon/--lat for SLC discovery (Default: 0.2).")
+    parser.add_argument("--roi_dlonlat", type=float, default=None,
+                        help="Processing/post-processing ROI buffer in degrees around --lon/--lat. Default equals --search_dlonlat. Use 0 to disable ROI and process/crop the full available extent.")
+    parser.add_argument("--dlonlat", type=float, default=None,
+                        help="Deprecated compatibility alias for --search_dlonlat. If --roi_dlonlat is not set, ROI also follows this value.")
 
     # Download / ZIP verification
     parser.add_argument("--zip_check_backend", type=str, default="auto", choices=["auto", "python", "zipinfo"],
@@ -2390,6 +2420,22 @@ def main():
         sys.exit(0)
         
     args = parser.parse_args()
+
+    # Spatial buffer normalization.
+    # --dlonlat is kept as a deprecated compatibility alias. New code should use
+    # --search_dlonlat for data discovery and --roi_dlonlat for ISCE ROI/cropping.
+    if args.search_dlonlat is None:
+        args.search_dlonlat = args.dlonlat if args.dlonlat is not None else 0.2
+    if args.roi_dlonlat is None:
+        args.roi_dlonlat = args.search_dlonlat
+
+    if args.search_dlonlat < 0:
+        parser.error("[!] --search_dlonlat must be non-negative.")
+    if args.roi_dlonlat < 0:
+        parser.error("[!] --roi_dlonlat must be non-negative. Use 0 to disable ROI cropping.")
+
+    if args.dlonlat is not None:
+        print("[!] Warning: --dlonlat is deprecated. Use --search_dlonlat and --roi_dlonlat instead.")
     
     # ==========================================
     # Input Validation based on Mode
@@ -2417,6 +2463,11 @@ def main():
     print(f"[*] Execution Mode : {args.mode.upper()}")
     print(f"[*] Data Source    : {args.data_source.upper()}")
     print(f"[*] Execution Step : '{args.step}'")
+    print(f"[*] Search Buffer  : {args.search_dlonlat} deg")
+    if args.roi_dlonlat == 0:
+        print("[*] ROI Buffer     : disabled/full extent")
+    else:
+        print(f"[*] ROI Buffer     : {args.roi_dlonlat} deg")
     print("#"*60)
     
     pipeline = AutoInSAR_Pipeline(args)
