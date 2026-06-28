@@ -179,6 +179,73 @@ class AutoInSAR_Pipeline:
                 sys.exit(1)
             return False
 
+    def _write_extent_and_boundary_from_points(self, footprint_points,
+                                               extent_filename="extent.txt",
+                                               boundary_filename="boundary.txt"):
+        """Write DEM extent and a GMT-friendly SAR footprint boundary.
+
+        Parameters
+        ----------
+        footprint_points : list of tuple
+            List of (lon, lat) coordinates extracted from real SLC footprint
+            polygons returned by ASF/Copernicus. Search-bbox fallback is
+            intentionally not used here; if footprint parsing fails, the caller
+            should stop rather than write a misleading boundary.
+
+        Outputs
+        -------
+        extent.txt
+            Four-line DEM extent: min_lat, max_lat, min_lon, max_lon.
+        boundary.txt
+            Five-line closed lon/lat polygon built from the true SAR footprint
+            extreme points in the order: north, east, south, west, north.
+            This is convenient for GMT psxy plotting of the tilted SAR coverage.
+        """
+        valid_points = []
+        for lon, lat in footprint_points:
+            try:
+                lon = float(lon)
+                lat = float(lat)
+            except Exception:
+                continue
+            if math.isfinite(lon) and math.isfinite(lat):
+                valid_points.append((lon, lat))
+
+        if not valid_points:
+            return False
+
+        lons = [p[0] for p in valid_points]
+        lats = [p[1] for p in valid_points]
+        min_lon, max_lon = min(lons), max(lons)
+        min_lat, max_lat = min(lats), max(lats)
+
+        with open(extent_filename, "w") as f_ext:
+            f_ext.write(f"{min_lat}\n")
+            f_ext.write(f"{max_lat}\n")
+            f_ext.write(f"{min_lon}\n")
+            f_ext.write(f"{max_lon}\n")
+
+        # Pick footprint extreme points, not the axis-aligned extent corners.
+        # Tie-breakers keep the result deterministic when two points share the
+        # same extreme latitude/longitude.
+        north = max(valid_points, key=lambda p: (p[1], p[0]))
+        east = max(valid_points, key=lambda p: (p[0], -p[1]))
+        south = min(valid_points, key=lambda p: (p[1], p[0]))
+        west = min(valid_points, key=lambda p: (p[0], -p[1]))
+        boundary_points = [north, east, south, west, north]
+
+        with open(boundary_filename, "w") as f_bnd:
+            for lon, lat in boundary_points:
+                f_bnd.write(f"{lon} {lat}\n")
+
+        unique_boundary_points = {(round(lon, 8), round(lat, 8)) for lon, lat in boundary_points[:-1]}
+        if len(unique_boundary_points) < 4:
+            print("[!] Warning: SAR footprint extreme boundary has repeated points. Check boundary.txt before GMT plotting.")
+
+        print(f"[*] Extent saved to {extent_filename}: Lat [{min_lat}, {max_lat}], Lon [{min_lon}, {max_lon}]")
+        print(f"[*] SLC boundary polygon saved to {boundary_filename} (GMT lon/lat, closed SAR footprint extremes: N-E-S-W-N)")
+        return True
+
     # --------------------------------------------------------------------------
     # Step 1: SLC Data Search
     # --------------------------------------------------------------------------
@@ -394,32 +461,26 @@ class AutoInSAR_Pipeline:
                 f_url.write(f"{item['downloadUrl']}\n")
                 total_size += float(item.get('sizeMB', 0))
         
-        # Calculate and Save Spatial Extent 
-        print("[*] Calculating spatial coverage from footprints...")
-        min_lon, max_lon = float('inf'), float('-inf')
-        min_lat, max_lat = float('inf'), float('-inf')
-        
+        # Calculate and Save Spatial Extent / SAR Footprint Boundary
+        print("[*] Calculating spatial coverage from real ASF footprints...")
+        footprint_points = []
+
         for item in final_results:
-            if 'stringFootprint' in item:
-                footprint = item['stringFootprint']
-                coordinates = re.findall(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", footprint)
-                for lon_str, lat_str in coordinates:
-                    lon, lat = float(lon_str), float(lat_str)
-                    min_lon = min(min_lon, lon)
-                    max_lon = max(max_lon, lon)
-                    min_lat = min(min_lat, lat)
-                    max_lat = max(max_lat, lat)
+            footprint = item.get('stringFootprint')
+            if not footprint:
+                continue
+            coordinates = re.findall(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", footprint)
+            for lon_str, lat_str in coordinates:
+                footprint_points.append((float(lon_str), float(lat_str)))
 
         extent_filename = "extent.txt"
-        if min_lon != float('inf'):
-            with open(extent_filename, "w") as f_ext:
-                f_ext.write(f"{min_lat}\n")
-                f_ext.write(f"{max_lat}\n")
-                f_ext.write(f"{min_lon}\n")
-                f_ext.write(f"{max_lon}\n")
-            print(f"[*] Extent saved to {extent_filename}: Lat [{min_lat}, {max_lat}], Lon [{min_lon}, {max_lon}]")
-        else:
-            print("[!] Warning: Could not calculate extent (footprint data missing).")
+        boundary_filename = "boundary.txt"
+        if not self._write_extent_and_boundary_from_points(
+            footprint_points,
+            extent_filename=extent_filename,
+            boundary_filename=boundary_filename,
+        ):
+            sys.exit("[!] Error: Could not parse ASF footprint coordinates. extent.txt/boundary.txt were not generated.")
 
         # Acquire SLC dates
         acquired_dates = [item.get('startTime', 'Unknown')[:10] for item in final_results]
@@ -438,6 +499,7 @@ class AutoInSAR_Pipeline:
         print(f"    - File List saved to: {list_filename}")
         print(f"    - URL List saved to: {url_filename}")
         print(f"    - Extent File saved to: {extent_filename}")
+        print(f"    - Boundary File saved to: {boundary_filename}")
 
         self.slc_file_list = list_filename
         self.slc_url_list = url_filename
@@ -715,32 +777,21 @@ class AutoInSAR_Pipeline:
                 except Exception:
                     pass
 
-        min_lon_f, max_lon_f = float('inf'), float('-inf')
-        min_lat_f, max_lat_f = float('inf'), float('-inf')
+        footprint_points = []
         for item in final_results:
             geo = item.get("GeoFootprint")
-            for lon, lat in self._iter_geojson_coords(geo.get("coordinates", []) if isinstance(geo, dict) else geo):
-                min_lon_f = min(min_lon_f, lon)
-                max_lon_f = max(max_lon_f, lon)
-                min_lat_f = min(min_lat_f, lat)
-                max_lat_f = max(max_lat_f, lat)
+            coords = geo.get("coordinates", []) if isinstance(geo, dict) else geo
+            for lon, lat in self._iter_geojson_coords(coords):
+                footprint_points.append((lon, lat))
 
         extent_filename = "extent.txt"
-        if min_lon_f != float('inf'):
-            with open(extent_filename, "w") as f_ext:
-                f_ext.write(f"{min_lat_f}\n")
-                f_ext.write(f"{max_lat_f}\n")
-                f_ext.write(f"{min_lon_f}\n")
-                f_ext.write(f"{max_lon_f}\n")
-            print(f"[*] Extent saved to {extent_filename}: Lat [{min_lat_f}, {max_lat_f}], Lon [{min_lon_f}, {max_lon_f}]")
-        else:
-            # Fall back to the requested search box so DEM/config steps can continue.
-            with open(extent_filename, "w") as f_ext:
-                f_ext.write(f"{min_lat}\n")
-                f_ext.write(f"{max_lat}\n")
-                f_ext.write(f"{min_lon}\n")
-                f_ext.write(f"{max_lon}\n")
-            print(f"[!] Warning: Could not parse Copernicus GeoFootprint. Search bbox saved to {extent_filename}.")
+        boundary_filename = "boundary.txt"
+        if not self._write_extent_and_boundary_from_points(
+            footprint_points,
+            extent_filename=extent_filename,
+            boundary_filename=boundary_filename,
+        ):
+            sys.exit("[!] Error: Could not parse Copernicus GeoFootprint coordinates. extent.txt/boundary.txt were not generated.")
 
         display_dates = sorted(list(set(unique_dates)))
         target_dir = orbit_map.get(self.target_orbit, 'UNKNOWN')
@@ -753,6 +804,7 @@ class AutoInSAR_Pipeline:
         print(f"    - File List saved to: {list_filename}")
         print(f"    - URL List saved to: {url_filename}")
         print(f"    - Extent File saved to: {extent_filename}")
+        print(f"    - Boundary File saved to: {boundary_filename}")
 
         self.slc_file_list = list_filename
         self.slc_url_list = url_filename
@@ -1087,6 +1139,34 @@ class AutoInSAR_Pipeline:
                 log(f"Download Failed (Verification Error): {fname}")
                 if os.path.exists(target_path):
                     shutil.move(target_path, os.path.join(unused_dir, fname))
+
+        # Pair-mode final validation: fail fast before ISCE processing if any
+        # requested SLC ZIP is still missing or invalid. This keeps stack downloads
+        # tolerant to occasional failures, while avoiding confusing downstream
+        # topsApp errors for small pair-mode runs.
+        if self.mode == 'pair':
+            print("[*] Pair mode final ZIP validation...")
+            invalid_files = []
+            for fname, _url in task_list:
+                if not fname:
+                    continue
+                if not fname.endswith('.zip'):
+                    fname += '.zip'
+                target_path = os.path.join(slc_dir, fname)
+                if not os.path.exists(target_path):
+                    invalid_files.append((fname, "missing"))
+                elif not is_valid_zip(target_path):
+                    invalid_files.append((fname, "invalid ZIP"))
+
+            if invalid_files:
+                log("Pair mode final ZIP validation failed.")
+                print("\n[!] ERROR: Pair mode requires all requested SLC ZIP files to be present and valid before processing.")
+                for fname, reason in invalid_files:
+                    print(f"    - {fname}: {reason}")
+                print("\n[!] Please rerun Step 2 download after removing the bad/missing files, then rerun processing.")
+                sys.exit(1)
+            else:
+                log("Pair mode final ZIP validation passed for all requested SLC files.")
 
         # Cleanup
         if os.path.exists(unused_dir):
