@@ -20,16 +20,16 @@ The pipeline operates in two distinct modes controlled by the `--mode` argument:
 
 The pipeline automates the following 8 steps dynamically based on the selected mode:
 
-1.  **Search**: Auto-query SLC images from ASF (default) or Copernicus Data Space Ecosystem. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks, with an independent search buffer controlled by `--search_dlonlat`.
-2.  **Download**: Sequential downloading of SLC data with ZIP integrity verification and auto-resume.
-3.  **Orbit**: Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files with robust time-window matching.
-4.  **DEM**: Auto-download and stitch SRTMGL1 DEM tiles covering the region of interest.
-5.  **Config**: Auto-generation of ISCE XML configs (`tops.xml`) OR sequential execution scripts (`run_01` to `run_13` for stack mode), with an independent processing ROI controlled by `--roi_dlonlat`.
-6.  **Process**: Execution of the standard `topsApp.py` workflow OR safe, sequential execution of the stack scripts.
-7.  **Post-Processing**: 
+1.  **search**: Auto-query SLC images from ASF (default) or Copernicus Data Space Ecosystem. Supports event-based search (±12 days), manual pairs, or multi-year time-series stacks, with an independent search buffer controlled by `--search_dlonlat`.
+2.  **download**: Sequential downloading of SLC data with ZIP integrity verification and auto-resume.
+3.  **orbit**: Auto-fetch Precision (POEORB) or Restituted (RESORB) orbit files with robust time-window matching.
+4.  **dem**: Auto-download and stitch SRTMGL1 DEM tiles covering the region of interest.
+5.  **config**: Auto-generation of ISCE XML configs (`tops.xml`) OR sequential execution scripts (`run_01` to `run_13` for stack mode), with an independent processing ROI controlled by `--roi_dlonlat`.
+6.  **process**: Execution of the standard `topsApp.py` workflow OR safe, sequential execution of the stack scripts.
+7.  **post**: 
     * *(Pair)*: GDAL extraction, E/N/U decomposition, and Matplotlib 2D visualization.
     * *(Stack)*: Spatiotemporal baseline network plotting and automated PS/SBAS mode recommendation.
-8.  **Cleanup**: Intelligent removal of bulky raw data (SLC/DEM/Orbit) and intermediate ISCE products to save massive disk space, retaining only final high-value results.
+8.  **clean**: Intelligent removal of bulky raw data (SLC/DEM/Orbit) and intermediate ISCE products to save massive disk space, retaining only final high-value results.
 
 ## 3. Prerequisites
 
@@ -161,7 +161,7 @@ You can run the pipeline step-by-step using the `--step` argument. Useful for de
 python autoInSAR.py --mode stack --step clean
 ```
 
-**Options:** `search`, `download`, `orbit`, `dem`, `xml`, `isce`, `post`, `all` (default), `clean`.
+**Options:** `search`, `download`, `orbit`, `dem`, `coreg`, `process`, `post`, `all` (default), `clean`.
 
 ## 6. Arguments
 
