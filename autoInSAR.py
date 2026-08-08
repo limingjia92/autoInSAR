@@ -1499,8 +1499,10 @@ class AutoInSAR_Pipeline:
                 bbox_option = f" -b '{bbox_str}'"
                 print(f"[*] Stack Bounding Box (S N W E): '{bbox_str}'")
             
-            # Construct command. 
-            # Note: The script runs INSIDE 'process/', so directories are '../'
+            # Generate one independent command per line. Step 6 owns all runtime
+            # scheduling, progress reporting, logging, and restart behavior.
+            # Keeping stackSentinel at num_proc=1 prevents embedded '&' / 'wait'
+            # groups from interfering with AutoInSAR's dynamic task pool.
             cmd = (
                 f"stackSentinel.py "
                 f"-s ../SLC/ "
@@ -1508,14 +1510,16 @@ class AutoInSAR_Pipeline:
                 f"-a ../AUX/ "
                 f"-d ../DEM/{dem_name} "
                 f"-W slc "
-                f"-useGPU"
+                f"-useGPU "
+                f"--num_proc 1 "
+                f"--num_proc4topo 1"
                 f"{bbox_option}"
             )
             
             cwd = os.getcwd()
             try:
                 os.chdir(process_dir)
-                print(f"[*] Executing stackSentinel.py to map network and build run_* scripts...")
+                print(f"[*] Executing stackSentinel.py to map network and build serial-form run_* scripts...")
                 self.run_command(cmd)
             except Exception as e:
                 print(f"[!] Error generating stack scripts: {e}")
@@ -1524,6 +1528,13 @@ class AutoInSAR_Pipeline:
                 os.chdir(cwd)
                 
             print(f"[*] Step 5 Stack config completed. 'run_*' scripts generated in: {process_dir}")
+            if getattr(self.args, "num_proc", 0) > 0:
+                print(
+                    f"[*] Step 6 will use the user worker ceiling --num_proc "
+                    f"{self.args.num_proc} for run_03/06/07/10/13, subject to CPU/memory safety limits."
+                )
+            else:
+                print("[*] Step 6 will select runtime parallelism automatically for each run stage.")
             
     # --------------------------------------------------------------------------
     # Step 6: ISCE Processing
@@ -1562,51 +1573,735 @@ class AutoInSAR_Pipeline:
                 print(f"[*] Step 6 Pair processing finished.")
 
             # ==========================================
-            # Mode B: Stack (Execute run_* sequentially)
+            # Mode B: Stack (Stage-sequential, task-parallel execution)
             # ==========================================
             elif self.mode == 'stack':
+                # Imports are intentionally local to the Stack branch so Pair mode
+                # and all other pipeline steps retain their original behavior.
+                import hashlib
+                import signal
+                import socket
+                from collections import deque
+
                 run_dir = "run_files"
+                state_dir = "autoinsar_state"
+                log_root = os.path.join("logs", "stack_runs")
+                os.makedirs(state_dir, exist_ok=True)
+                os.makedirs(log_root, exist_ok=True)
+
                 print(f"[*] Scanning for 'run_*' scripts in '{run_dir}/'...")
-                
-                # 去 run_files 子目录里匹配脚本
+
                 run_files = glob.glob(os.path.join(run_dir, "run_*"))
-                
                 valid_runs = []
                 for f in run_files:
                     if os.path.isfile(f):
-                        # 使用 basename 提取数字，防止路径名干扰
                         match = re.search(r'run_(\d+)', os.path.basename(f))
                         if match:
                             valid_runs.append((int(match.group(1)), f))
-                
+
                 if not valid_runs:
                     sys.exit(f"[!] Error: No 'run_*' scripts found in 'process/{run_dir}/'. Please run Step 5 first.")
-                
-                # Sort numerically (1, 2, 3... instead of 1, 10, 11, 2...)
+
                 valid_runs.sort(key=lambda x: x[0])
                 total_scripts = len(valid_runs)
-                
-                print(f"[*] Found {total_scripts} stack processing scripts.")
-                print("    (This will take significant time depending on the number of SLCs...)")
-                
-                for idx, (run_num, script_name) in enumerate(valid_runs, 1):
-                    print("-" * 40)
-                    print(f"[Progress: {idx}/{total_scripts}] Executing: {script_name}")
-                    
-                    # Execute the bash script directly via 'sh'
-                    # 命令将会是: sh run_files/run_01_unpack_topo_reference
-                    cmd = f"sh {script_name}"
-                    
+
+                def _run_capture(command):
+                    """Run a small inspection command and return stripped stdout."""
                     try:
-                        # We use quiet=True so the console isn't flooded, but ISCE2 will 
-                        # still write to its log files natively.
-                        self.run_command(cmd, quiet=True)
+                        result = subprocess.run(
+                            command,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            check=False,
+                        )
+                        if result.returncode == 0:
+                            return result.stdout.strip()
+                    except Exception:
+                        pass
+                    return ""
+
+                def _available_cpu_count():
+                    """Respect scheduler/cgroup CPU affinity where available."""
+                    try:
+                        return max(1, len(os.sched_getaffinity(0)))
+                    except Exception:
+                        return max(1, os.cpu_count() or 1)
+
+                def _available_memory_gib():
+                    """Return the smaller of host-available and cgroup-limited memory."""
+                    candidates = []
+                    try:
+                        with open("/proc/meminfo", "r") as f:
+                            for line in f:
+                                if line.startswith("MemAvailable:"):
+                                    kib = int(line.split()[1])
+                                    candidates.append(kib * 1024.0)
+                                    break
+                    except Exception:
+                        pass
+
+                    # cgroup v2 and v1 limits make the scheduler portable to
+                    # containers and HPC batch allocations.
+                    for limit_path in (
+                        "/sys/fs/cgroup/memory.max",
+                        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                    ):
+                        try:
+                            raw_value = open(limit_path, "r").read().strip()
+                            if raw_value and raw_value != "max":
+                                limit_bytes = float(raw_value)
+                                # Ignore common effectively-unlimited sentinel values.
+                                if 0 < limit_bytes < 2**60:
+                                    candidates.append(limit_bytes)
+                        except Exception:
+                            pass
+
+                    if candidates:
+                        return min(candidates) / (1024.0 ** 3)
+                    return 8.0
+
+                def _detect_gpu_devices():
+                    """Return visible NVIDIA device identifiers, respecting batch limits."""
+                    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    if visible is not None:
+                        visible = visible.strip()
+                        if not visible or visible in {"-1", "NoDevFiles"}:
+                            return []
+                        return [item.strip() for item in visible.split(",") if item.strip()]
+
+                    output = _run_capture(["nvidia-smi", "-L"])
+                    if output:
+                        return [
+                            str(index)
+                            for index, line in enumerate(output.splitlines())
+                            if line.strip().startswith("GPU ")
+                        ]
+
+                    devices = []
+                    for device_path in sorted(glob.glob("/dev/nvidia[0-9]*")):
+                        match = re.search(r'nvidia(\d+)$', device_path)
+                        if match:
+                            devices.append(match.group(1))
+                    return devices
+
+                def _detect_storage(process_path):
+                    """Classify the filesystem hosting process/ for conservative I/O limits."""
+                    source = _run_capture(["findmnt", "-T", process_path, "-n", "-o", "SOURCE"])
+                    fstype = _run_capture(["findmnt", "-T", process_path, "-n", "-o", "FSTYPE"]).lower()
+                    source_device = source.split("[", 1)[0]
+
+                    network_fs = {"nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs"}
+                    parallel_fs = {"lustre", "gpfs", "beegfs", "ceph", "cephfs"}
+                    conservative_fs = {"fuseblk", "ntfs", "ntfs3", "exfat", "vfat"}
+
+                    if fstype in network_fs:
+                        return {
+                            "class": "network",
+                            "source": source or "unknown",
+                            "fstype": fstype or "unknown",
+                            "rotational": None,
+                            "parallel_cap": 2,
+                        }
+                    if fstype in parallel_fs:
+                        return {
+                            "class": "parallel-filesystem",
+                            "source": source or "unknown",
+                            "fstype": fstype or "unknown",
+                            "rotational": None,
+                            "parallel_cap": 12,
+                        }
+
+                    rotational = None
+                    if source_device.startswith("/dev/"):
+                        rota_output = _run_capture(["lsblk", "-s", "-n", "-o", "ROTA", source_device])
+                        rota_values = [value for value in rota_output.split() if value in {"0", "1"}]
+                        if rota_values:
+                            rotational = any(value == "1" for value in rota_values)
+
+                    source_lower = source_device.lower()
+                    if fstype in conservative_fs:
+                        storage_class = "conservative-local"
+                        parallel_cap = 2
+                    elif rotational is True:
+                        storage_class = "hdd"
+                        parallel_cap = 4
+                    elif "nvme" in source_lower:
+                        storage_class = "nvme"
+                        parallel_cap = 12
+                    elif rotational is False:
+                        storage_class = "ssd"
+                        parallel_cap = 8
+                    else:
+                        storage_class = "unknown"
+                        parallel_cap = 4
+
+                    return {
+                        "class": storage_class,
+                        "source": source or "unknown",
+                        "fstype": fstype or "unknown",
+                        "rotational": rotational,
+                        "parallel_cap": parallel_cap,
+                    }
+
+                def _read_run_commands(run_file):
+                    """Read independent commands and normalize old '&'/'wait' run files."""
+                    commands = []
+                    with open(run_file, "r") as f:
+                        for raw_line in f:
+                            line = raw_line.strip()
+                            if not line or line.startswith("#") or line == "wait":
+                                continue
+                            if line.endswith("&"):
+                                line = line[:-1].rstrip()
+                            if line:
+                                commands.append(line)
+                    return commands
+
+                def _task_label(command):
+                    """Extract a compact date/config label for terminal progress output."""
+                    try:
+                        tokens = shlex.split(command)
+                        if "-c" in tokens:
+                            config_index = tokens.index("-c") + 1
+                            if config_index < len(tokens):
+                                config_candidate = tokens[config_index]
+                                config_basename = os.path.basename(config_candidate)
+                                if config_candidate.startswith("configs/") or config_basename.startswith("config_"):
+                                    return config_basename
+                    except Exception:
+                        pass
+
+                    date_pair = re.search(r'(20\d{6}(?:_20\d{6})?)', command)
+                    if date_pair:
+                        return date_pair.group(1)
+
+                    try:
+                        return os.path.basename(shlex.split(command)[0])
+                    except Exception:
+                        return command[:80]
+
+                def _run_fingerprint(run_file, commands):
+                    """Hash the run file and every referenced config file."""
+                    digest = hashlib.sha256()
+                    digest.update(b"autoinsar-stack-scheduler-v1\0")
+                    digest.update(os.path.basename(run_file).encode("utf-8", errors="replace"))
+                    digest.update(b"\0")
+
+                    with open(run_file, "rb") as f:
+                        digest.update(f.read())
+
+                    config_paths = set()
+                    for command in commands:
+                        try:
+                            tokens = shlex.split(command)
+                        except Exception:
+                            tokens = []
+                        for index, token in enumerate(tokens[:-1]):
+                            if token == "-c":
+                                config_candidate = tokens[index + 1]
+                                config_basename = os.path.basename(config_candidate)
+                                if config_candidate.startswith("configs/") or config_basename.startswith("config_"):
+                                    config_paths.add(config_candidate)
+
+                    for config_path in sorted(config_paths):
+                        digest.update(b"\0CONFIG\0")
+                        digest.update(config_path.encode("utf-8", errors="replace"))
+                        digest.update(b"\0")
+                        if os.path.isfile(config_path):
+                            with open(config_path, "rb") as f:
+                                digest.update(f.read())
+                        else:
+                            digest.update(b"MISSING")
+
+                    return digest.hexdigest()
+
+                def _atomic_write_json(path, payload):
+                    """Write state metadata atomically to avoid partial marker files."""
+                    temp_path = path + ".tmp"
+                    with open(temp_path, "w") as f:
+                        json.dump(payload, f, indent=2, sort_keys=True)
+                        f.write("\n")
+                    os.replace(temp_path, path)
+
+                def _load_json(path):
+                    try:
+                        with open(path, "r") as f:
+                            return json.load(f)
+                    except Exception:
+                        return None
+
+                def _format_duration(seconds):
+                    seconds = max(0, int(seconds))
+                    return str(timedelta(seconds=seconds))
+
+                cpu_count = _available_cpu_count()
+                memory_gib = _available_memory_gib()
+                gpu_devices = _detect_gpu_devices()
+                gpu_count = len(gpu_devices)
+                storage = _detect_storage(os.getcwd())
+
+                # Automatic mode is deliberately conservative: reserve CPU and
+                # memory for the OS and let storage type constrain data-intensive
+                # Sentinel-1 stages. A positive --num_proc explicitly overrides
+                # the CPU/4 and storage recommendations, but not the real CPU and
+                # memory safety ceilings.
+                auto_cpu_cap = max(1, cpu_count // 4)
+                memory_cap = max(1, int((memory_gib * 0.70) // 8.0))
+                auto_cap = max(
+                    1,
+                    min(auto_cpu_cap, memory_cap, storage["parallel_cap"]),
+                )
+
+                requested_cap = int(getattr(self.args, "num_proc", 0) or 0)
+                if requested_cap > 0:
+                    global_cap = max(1, min(requested_cap, cpu_count, memory_cap))
+                    worker_mode = "manual override"
+                else:
+                    global_cap = auto_cap
+                    worker_mode = "automatic"
+
+                print(f"[*] Found {total_scripts} stack processing scripts.")
+                print("[*] Auto-detected processing resources:")
+                print(f"    - Available CPU threads : {cpu_count}")
+                print(f"    - Available memory      : {memory_gib:.1f} GiB")
+                print(f"    - Storage source/type   : {storage['source']} ({storage['fstype']})")
+                print(f"    - Storage class         : {storage['class']} (auto cap={storage['parallel_cap']})")
+                print(f"    - Visible NVIDIA GPUs   : {gpu_count} ({', '.join(gpu_devices) if gpu_devices else 'none'})")
+                print(f"    - Automatic recommendation: {auto_cap}")
+
+                if requested_cap > 0:
+                    print(f"    - User-requested ceiling : {requested_cap}")
+                    if requested_cap > auto_cap:
+                        print(
+                            "[!] Manual --num_proc override exceeds the automatic "
+                            "storage-aware recommendation."
+                        )
+                        print(
+                            "    run_03/06/07/10/13 will honor the higher value "
+                            "within CPU/memory safety limits."
+                        )
+                    if global_cap < requested_cap:
+                        limiting_factors = []
+                        if cpu_count < requested_cap:
+                            limiting_factors.append(f"CPU={cpu_count}")
+                        if memory_cap < requested_cap:
+                            limiting_factors.append(f"memory_cap={memory_cap}")
+                        print(
+                            f"[!] Requested --num_proc {requested_cap} was reduced "
+                            f"to {global_cap} by hard safety limits "
+                            f"({', '.join(limiting_factors) or 'resource limit'})."
+                        )
+
+                print(f"    - Worker selection mode : {worker_mode}")
+                print(f"    - General worker ceiling: {global_cap}")
+
+                def _stage_policy(run_num, run_name):
+                    """Return workers and GPU scheduling behavior for one ISCE run stage."""
+                    name = run_name.lower()
+                    gpu_stage = "geo2rdr" in name
+
+                    if run_num in {1, 4, 8, 11}:
+                        stage_cap = 1
+                    elif run_num == 2:
+                        stage_cap = 2 if storage["class"] in {"hdd", "network", "conservative-local", "unknown"} else 4
+                    elif run_num in {5, 9}:
+                        stage_cap = max(1, gpu_count) if gpu_count > 0 else 1
+                    elif run_num in {3, 6, 7, 10, 13}:
+                        # General scalable stages use the selected global ceiling.
+                        # In automatic mode this remains storage-aware; a positive
+                        # --num_proc intentionally replaces that recommendation.
+                        stage_cap = global_cap
+                    elif run_num == 12:
+                        if storage["class"] in {"network", "conservative-local"}:
+                            stage_cap = 1
+                        elif storage["class"] in {"hdd", "unknown"}:
+                            stage_cap = 2
+                        elif storage["class"] == "nvme":
+                            stage_cap = 8
+                        else:
+                            stage_cap = 4
+                    else:
+                        stage_cap = global_cap
+
+                    workers = max(1, min(global_cap, stage_cap))
+                    if gpu_stage:
+                        workers = 1 if gpu_count <= 0 else max(1, min(workers, gpu_count))
+
+                    return workers, gpu_stage
+
+                def _terminate_running(running, reason):
+                    """Terminate all active process groups and close their log files."""
+                    if not running:
+                        return
+                    print(f"[!] {reason}. Stopping {len(running)} active task(s)...", flush=True)
+
+                    for task in running.values():
+                        process = task["process"]
+                        if process.poll() is None:
+                            try:
+                                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                            except (ProcessLookupError, PermissionError):
+                                pass
+
+                    deadline = time.time() + 10
+                    for task in running.values():
+                        process = task["process"]
+                        remaining = max(0.0, deadline - time.time())
+                        if process.poll() is None:
+                            try:
+                                process.wait(timeout=remaining)
+                            except subprocess.TimeoutExpired:
+                                try:
+                                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                                except (ProcessLookupError, PermissionError):
+                                    pass
+                        try:
+                            task["log"].close()
+                        except Exception:
+                            pass
+                    running.clear()
+
+                def _execute_stage(run_num, run_name, commands, workers, gpu_stage, stage_log_dir):
+                    """Execute one run file with a dynamic bounded task pool."""
+                    os.makedirs(stage_log_dir, exist_ok=True)
+                    pending = deque(enumerate(commands, start=1))
+                    running = {}
+                    total = len(commands)
+                    completed = 0
+                    stage_start = time.time()
+                    last_heartbeat = stage_start
+                    
+                    # Heartbeat display state for this run stage.
+                    heartbeat_active = False
+                    interactive_output = sys.stdout.isatty()
+
+                    def _clear_heartbeat():
+                        """Clear an active in-place heartbeat before normal output."""
+                        nonlocal heartbeat_active
+
+                        if heartbeat_active and interactive_output:
+                            print("\r\033[K", end="", flush=True)
+
+                        heartbeat_active = False
+
+                    def _print_heartbeat(message):
+                        """Refresh heartbeat in-place on terminals; append in redirected logs."""
+                        nonlocal heartbeat_active
+
+                        if interactive_output:
+                            print(f"\r\033[K{message}", end="", flush=True)
+                            heartbeat_active = True
+                        else:
+                            print(message, flush=True)
+
+                    print(f"[*] Stage tasks      : {total}")
+                    print(f"[*] Parallel workers : {workers}")
+                    print(f"[*] Task logs        : {stage_log_dir}/")
+
+                    try:
+                        while pending or running:
+                            while pending and len(running) < workers:
+                                task_index, command = pending.popleft()
+                                label = _task_label(command)
+                                safe_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', label)[:120] or "task"
+                                log_path = os.path.join(stage_log_dir, f"{task_index:04d}_{safe_label}.log")
+
+                                gpu_id = None
+                                if gpu_stage and gpu_count > 0:
+                                    used_gpu_ids = {
+                                        task["gpu_id"] for task in running.values()
+                                        if task["gpu_id"] is not None
+                                    }
+                                    available_gpu_ids = [
+                                        gpu_id_candidate for gpu_id_candidate in gpu_devices
+                                        if gpu_id_candidate not in used_gpu_ids
+                                    ]
+                                    if not available_gpu_ids:
+                                        break
+                                    gpu_id = available_gpu_ids[0]
+
+                                env = os.environ.copy()
+                                if gpu_id is not None:
+                                    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+                                log_handle = open(log_path, "w", buffering=1)
+                                log_handle.write(f"# AutoInSAR stack task\n")
+                                log_handle.write(f"# Run: {run_name}\n")
+                                log_handle.write(f"# Task: {task_index}/{total}\n")
+                                log_handle.write(f"# Started: {datetime.now().isoformat(timespec='seconds')}\n")
+                                if gpu_id is not None:
+                                    log_handle.write(f"# CUDA_VISIBLE_DEVICES: {gpu_id}\n")
+                                log_handle.write(f"# Command: {command}\n\n")
+
+                                try:
+                                    process = subprocess.Popen(
+                                        command,
+                                        shell=True,
+                                        stdout=log_handle,
+                                        stderr=subprocess.STDOUT,
+                                        start_new_session=True,
+                                        env=env,
+                                    )
+                                except Exception:
+                                    log_handle.close()
+                                    raise
+
+                                running[process.pid] = {
+                                    "process": process,
+                                    "index": task_index,
+                                    "label": label,
+                                    "command": command,
+                                    "log": log_handle,
+                                    "log_path": log_path,
+                                    "start": time.time(),
+                                    "gpu_id": gpu_id,
+                                }
+
+                                gpu_text = f" | GPU={gpu_id}" if gpu_id is not None else ""
+                                print(
+                                    f"    [START {task_index}/{total}] {label}{gpu_text}",
+                                    flush=True,
+                                )
+
+                            time.sleep(1)
+
+                            for pid, task in list(running.items()):
+                                process = task["process"]
+                                return_code = process.poll()
+                                if return_code is None:
+                                    continue
+
+                                try:
+                                    task["log"].write(
+                                        f"\n# Finished: {datetime.now().isoformat(timespec='seconds')}\n"
+                                        f"# Exit code: {return_code}\n"
+                                    )
+                                finally:
+                                    task["log"].close()
+                                running.pop(pid)
+
+                                task_elapsed = time.time() - task["start"]
+                                if return_code != 0:
+                                    print(
+                                        f"    [FAILED {task['index']}/{total}] {task['label']} "
+                                        f"| exit={return_code} | log={task['log_path']}",
+                                        flush=True,
+                                    )
+                                    raise RuntimeError(
+                                        f"{run_name} failed at task {task['index']}/{total}: {task['label']}"
+                                    )
+
+                                completed += 1
+                                elapsed = time.time() - stage_start
+                                percent = completed / total * 100.0
+                                eta_seconds = (elapsed / completed) * (total - completed) if completed else 0
+                                print(
+                                    f"    [DONE {completed}/{total} | {percent:6.2f}%] "
+                                    f"{task['label']} | task={_format_duration(task_elapsed)} "
+                                    f"| ETA={_format_duration(eta_seconds)}",
+                                    flush=True,
+                                )
+                                last_heartbeat = time.time()
+
+                            if time.time() - last_heartbeat >= 300:
+                                active_labels = [task["label"] for task in running.values()]
+                                elapsed = time.time() - stage_start
+
+                                eta_text = "calculating"
+                                if completed > 0:
+                                    eta_text = _format_duration(
+                                        (elapsed / completed) * (total - completed)
+                                    )
+
+                                _print_heartbeat(
+                                    f"    [RUNNING] elapsed={_format_duration(elapsed)} | "
+                                    f"{completed}/{total} completed | "
+                                    f"{len(running)} active | ETA={eta_text} | "
+                                    f"active: {', '.join(active_labels[:workers])}"
+                                )
+
+                                last_heartbeat = time.time()
+
+                    except KeyboardInterrupt:
+                        _terminate_running(running, "Keyboard interrupt received")
+                        raise
+                    except Exception:
+                        _terminate_running(running, "Stage failure detected")
+                        raise
+
+                    return time.time() - stage_start
+
+                prepared_runs = []
+                print("[*] Stage-aware execution plan:")
+                for run_num, script_name in valid_runs:
+                    run_name = os.path.basename(script_name)
+                    commands = _read_run_commands(script_name)
+                    if not commands:
+                        raise RuntimeError(f"No executable commands found in {script_name}")
+                    fingerprint = _run_fingerprint(script_name, commands)
+                    workers, gpu_stage = _stage_policy(run_num, run_name)
+                    prepared_runs.append({
+                        "run_num": run_num,
+                        "script_name": script_name,
+                        "run_name": run_name,
+                        "commands": commands,
+                        "fingerprint": fingerprint,
+                        "workers": workers,
+                        "gpu_stage": gpu_stage,
+                    })
+                    gpu_text = " (GPU-aware)" if gpu_stage else ""
+                    print(
+                        f"    - run_{run_num:02d}: tasks={len(commands)}, "
+                        f"workers={workers}{gpu_text}, file={run_name}"
+                    )
+
+                rerun_downstream = False
+                skipped_count = 0
+                pipeline_start = time.time()
+
+                for idx, run_info in enumerate(prepared_runs, 1):
+                    run_num = run_info["run_num"]
+                    run_name = run_info["run_name"]
+                    state_key = f"run_{run_num:02d}"
+                    done_path = os.path.join(state_dir, state_key + ".done")
+                    running_path = os.path.join(state_dir, state_key + ".running")
+                    failed_path = os.path.join(state_dir, state_key + ".failed")
+                    stage_log_dir = os.path.join(log_root, run_name)
+
+                    done_state = _load_json(done_path)
+                    done_valid = bool(
+                        done_state
+                        and done_state.get("fingerprint") == run_info["fingerprint"]
+                        and done_state.get("run_name") == run_name
+                    )
+
+                    if not rerun_downstream and done_valid:
+                        skipped_count += 1
+                        print("-" * 72)
+                        print(
+                            f"[Run {idx:02d}/{total_scripts}] SKIP {run_name}: "
+                            f"validated completion marker {done_path}"
+                        )
+                        continue
+
+                    if not rerun_downstream:
+                        rerun_downstream = True
+                        if os.path.exists(done_path) and not done_valid:
+                            print(
+                                f"[!] Completion marker for {run_name} is stale or incompatible; "
+                                "this stage and every downstream stage will be recomputed."
+                            )
+                        elif os.path.exists(running_path):
+                            print(
+                                f"[!] Previous execution stopped during {run_name}; "
+                                "the complete stage and every downstream stage will be recomputed."
+                            )
+                        elif os.path.exists(failed_path):
+                            print(
+                                f"[!] Previous execution failed during {run_name}; "
+                                "the complete stage and every downstream stage will be recomputed."
+                            )
+                        else:
+                            print(
+                                f"[*] No valid completion marker for {run_name}; "
+                                "execution will begin here and continue through all downstream stages."
+                            )
+                    elif done_valid:
+                        print(
+                            f"[*] Ignoring downstream marker for {run_name} because an upstream "
+                            "stage is being recomputed."
+                        )
+
+                    for stale_path in (done_path, running_path, failed_path):
+                        try:
+                            if os.path.exists(stale_path):
+                                os.remove(stale_path)
+                        except OSError:
+                            pass
+
+                    stage_started_at = datetime.now().isoformat(timespec="seconds")
+                    running_state = {
+                        "status": "running",
+                        "run_number": run_num,
+                        "run_name": run_name,
+                        "fingerprint": run_info["fingerprint"],
+                        "task_count": len(run_info["commands"]),
+                        "workers": run_info["workers"],
+                        "gpu_stage": run_info["gpu_stage"],
+                        "hostname": socket.gethostname(),
+                        "pid": os.getpid(),
+                        "started_at": stage_started_at,
+                    }
+                    _atomic_write_json(running_path, running_state)
+
+                    print("-" * 72)
+                    print(f"[Run {idx:02d}/{total_scripts}] START {run_name}")
+
+                    try:
+                        stage_elapsed = _execute_stage(
+                            run_num,
+                            run_name,
+                            run_info["commands"],
+                            run_info["workers"],
+                            run_info["gpu_stage"],
+                            stage_log_dir,
+                        )
+                    except KeyboardInterrupt:
+                        failed_state = dict(running_state)
+                        failed_state.update({
+                            "status": "interrupted",
+                            "ended_at": datetime.now().isoformat(timespec="seconds"),
+                        })
+                        _atomic_write_json(failed_path, failed_state)
+                        try:
+                            os.remove(running_path)
+                        except OSError:
+                            pass
+                        raise
                     except Exception as e:
-                        print(f"\n[!] CRITICAL ERROR during {script_name}")
-                        print("    Processing stopped. Please check ISCE2 logs for details.")
-                        sys.exit(1)
-                
+                        failed_state = dict(running_state)
+                        failed_state.update({
+                            "status": "failed",
+                            "ended_at": datetime.now().isoformat(timespec="seconds"),
+                            "error": str(e),
+                        })
+                        _atomic_write_json(failed_path, failed_state)
+                        try:
+                            os.remove(running_path)
+                        except OSError:
+                            pass
+                        raise
+
+                    done_state = dict(running_state)
+                    done_state.update({
+                        "status": "done",
+                        "ended_at": datetime.now().isoformat(timespec="seconds"),
+                        "elapsed_seconds": round(stage_elapsed, 3),
+                    })
+                    _atomic_write_json(done_path, done_state)
+                    try:
+                        os.remove(running_path)
+                    except OSError:
+                        pass
+                    try:
+                        if os.path.exists(failed_path):
+                            os.remove(failed_path)
+                    except OSError:
+                        pass
+
+                    print(
+                        f"[Run {idx:02d}/{total_scripts}] DONE {run_name} "
+                        f"| elapsed={_format_duration(stage_elapsed)} "
+                        f"| marker={done_path}"
+                    )
+
+                pipeline_elapsed = time.time() - pipeline_start
                 print(f"\n[*] Step 6 Stack processing finished successfully!")
+                print(f"[*] Validated/skipped stages: {skipped_count}/{total_scripts}")
+                print(f"[*] This invocation elapsed : {_format_duration(pipeline_elapsed)}")
+                print(f"[*] State markers           : {os.path.abspath(state_dir)}")
+                print(f"[*] Per-task logs           : {os.path.abspath(log_root)}")
                 print(f"[*] Coregistered SLCs are ready in: {os.path.join(process_dir, 'merged', 'SLC')}")
 
         except KeyboardInterrupt:
@@ -2467,9 +3162,20 @@ def main():
     parser.add_argument("--reference_date", type=str, help="[Pair Mode] Manual Reference Date (YYYYMMDD)")
     parser.add_argument("--secondary_date", type=str, help="[Pair Mode] Manual Secondary Date (YYYYMMDD)")
     
-    # Dates for Stack Mode (Time-Series)
+    # Dates / runtime control for Stack Mode (Time-Series)
     parser.add_argument("--start_date", type=str, help="[Stack Mode] Start Date for time-series (YYYYMMDD)")
     parser.add_argument("--end_date", type=str, help="[Stack Mode] End Date for time-series (YYYYMMDD)")
+    parser.add_argument(
+        "--num_proc",
+        type=int,
+        default=0,
+        help=(
+            "[Stack Mode] Maximum concurrent tasks for general parallel stages "
+            "(run_03/06/07/10/13). 0 uses automatic CPU/memory/storage-aware "
+            "selection; a positive value overrides the conservative automatic "
+            "recommendation but remains bounded by available CPU and memory."
+        ),
+    )
     
     # Platform
     parser.add_argument("--platform", type=str, default="Sentinel-1", 
@@ -2513,6 +3219,8 @@ def main():
         parser.error("[!] --search_dlonlat must be non-negative.")
     if args.roi_dlonlat < 0:
         parser.error("[!] --roi_dlonlat must be non-negative. Use 0 to disable ROI cropping.")
+    if args.num_proc < 0:
+        parser.error("[!] --num_proc must be 0 (automatic) or a positive integer.")
 
     if args.dlonlat is not None:
         print("[!] Warning: --dlonlat is deprecated. Use --search_dlonlat and --roi_dlonlat instead.")
@@ -2548,6 +3256,9 @@ def main():
         print("[*] ROI Buffer     : disabled/full extent")
     else:
         print(f"[*] ROI Buffer     : {args.roi_dlonlat} deg")
+    if args.mode == 'stack':
+        worker_setting = "automatic" if args.num_proc == 0 else str(args.num_proc)
+        print(f"[*] Stack Workers  : {worker_setting}")
     print("#"*60)
     
     pipeline = AutoInSAR_Pipeline(args)
