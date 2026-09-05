@@ -166,9 +166,10 @@ Search approximately ±12 days around an event date and process the resulting pa
 ```bash
 autoInSAR.py \
     --mode pair \
-    --lon 40.7 --lat 13.6 \
-    --event_date 20251117 \
-    --platform S1A
+    --lon 87.378 --lat 28.604 \
+    --event_date 20250107 \
+    --platform S1A \
+	--rel_orbit 121S
 ```
 
 ### 5.2 Pair mode — manual dates
@@ -176,9 +177,10 @@ autoInSAR.py \
 ```bash
 autoInSAR.py \
     --mode pair \
-    --lon 40.7 --lat 13.6 \
-    --reference_date 20251113 \
-    --secondary_date 20251125
+    --lon 87.378 --lat 28.604 \
+    --reference_date 20250101 \
+    --secondary_date 20250113 \
+	--rel_orbit 121
 ```
 
 ### 5.3 Stack mode — automatic parallel scheduling
