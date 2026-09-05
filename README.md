@@ -169,7 +169,7 @@ autoInSAR.py \
     --lon 87.378 --lat 28.604 \
     --event_date 20250107 \
     --platform S1A \
-	--rel_orbit 121S
+	--rel_orbit 121
 ```
 
 ### 5.2 Pair mode — manual dates
