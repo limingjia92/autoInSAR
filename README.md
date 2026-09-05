@@ -164,7 +164,7 @@ After that, `autoInSAR.py` can be called from the working directory of an InSAR 
 Search approximately ±12 days around an event date and process the resulting pair:
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode pair \
     --lon 40.7 --lat 13.6 \
     --event_date 20251117 \
@@ -174,7 +174,7 @@ python autoInSAR.py \
 ### 5.2 Pair mode — manual dates
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode pair \
     --lon 40.7 --lat 13.6 \
     --reference_date 20251113 \
@@ -186,7 +186,7 @@ python autoInSAR.py \
 `--num_proc 0` is the default and enables hardware-aware automatic worker selection:
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode stack \
     --lon 40.7 --lat 13.6 \
     --start_date 20200101 \
@@ -200,7 +200,7 @@ python autoInSAR.py \
 For example, request up to six concurrent tasks for the scalable Stack stages:
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode stack \
     --lon 40.7 --lat 13.6 \
     --start_date 20200101 \
@@ -214,7 +214,7 @@ A positive `--num_proc` overrides the conservative automatic CPU/storage recomme
 ### 5.5 Copernicus data source
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --data_source copernicus \
     --mode stack \
     --lon -67.9 --lat 10.5 \
@@ -229,7 +229,7 @@ python autoInSAR.py \
 Use a wider area for SLC discovery while processing a smaller ROI:
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode pair \
     --lon 40.7 --lat 13.6 \
     --event_date 20251117 \
@@ -242,7 +242,7 @@ python autoInSAR.py \
 Set `--roi_dlonlat 0` to omit an explicit ISCE ROI and use the full available overlap:
 
 ```bash
-python autoInSAR.py \
+autoInSAR.py \
     --mode pair \
     --lon 40.7 --lat 13.6 \
     --event_date 20251117 \
@@ -266,44 +266,44 @@ search  download  orbit  dem  config  process  post  clean  all
 
 ```bash
 # Step 1: search
-python autoInSAR.py --mode stack --step search \
+autoInSAR.py --mode stack --step search \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
 
 # Step 2: download
-python autoInSAR.py --mode stack --step download \
+autoInSAR.py --mode stack --step download \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
 
 # Step 3: orbit
-python autoInSAR.py --mode stack --step orbit \
+autoInSAR.py --mode stack --step orbit \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
 
 # Step 4: DEM
-python autoInSAR.py --mode stack --step dem \
+autoInSAR.py --mode stack --step dem \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
 
 # Step 5: generate stackSentinel configs/run files
-python autoInSAR.py --mode stack --step config \
+autoInSAR.py --mode stack --step config \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
 
 # Step 6: execute the Stack scheduler; here the general worker ceiling is 6
-python autoInSAR.py --mode stack --step process \
+autoInSAR.py --mode stack --step process \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157 \
     --num_proc 6
 
 # Step 7: baseline analysis / StaMPS-HPC command generation
-python autoInSAR.py --mode stack --step post \
+autoInSAR.py --mode stack --step post \
     --lon 110.0 --lat 19.2 \
     --start_date 20180101 --end_date 20241231 \
     --rel_orbit 157
