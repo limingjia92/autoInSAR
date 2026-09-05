@@ -65,7 +65,7 @@ search -> download -> orbit -> dem -> config -> process -> post
 **`clean` is intentionally NOT included in `all`.** Cleanup must always be requested explicitly:
 
 ```bash
-python autoInSAR.py --mode stack --step clean
+autoInSAR.py --mode stack --step clean
 ```
 
 This prevents successful source/intermediate data from being deleted automatically at the end of a long run.
@@ -309,7 +309,7 @@ autoInSAR.py --mode stack --step post \
     --rel_orbit 157
 
 # Optional Step 8: cleanup
-python autoInSAR.py --mode stack --step clean
+autoInSAR.py --mode stack --step clean
 ```
 
 ### Re-running `--step process`
