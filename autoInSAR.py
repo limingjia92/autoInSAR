@@ -3013,7 +3013,13 @@ class AutoInSAR_Pipeline:
                 lon[:] = x
                 lat[:] = y
                 z[:] = np.asarray(data, dtype=np.float32)
-
+                
+                valid = np.asarray(data)[np.isfinite(data)]
+                if valid.size:
+                    z.actual_range = np.asarray(
+                        [valid.min(), valid.max()], dtype=np.float32
+                    )
+                
                 lon.units, lon.standard_name = 'degrees_east', 'longitude'
                 lat.units, lat.standard_name = 'degrees_north', 'latitude'
                 nc.Conventions = 'COARDS, CF-1.7'
