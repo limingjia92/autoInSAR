@@ -137,8 +137,6 @@ Clone the repository and make the script executable:
 
 ```bash
 git clone https://github.com/limingjia92/autoInSAR.git
-cd autoInSAR
-chmod 755 autoInSAR.py
 ```
 
 Optionally add the repository directory to `PATH`:
