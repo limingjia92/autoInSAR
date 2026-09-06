@@ -2953,51 +2953,109 @@ class AutoInSAR_Pipeline:
         return data, (lons, lats, gt, proj)
 
     def _save_grd(self, result_dir, out_name, data, geo_info):
-        """save file in GMT GRD or GTiff format"""
+        """Save raster: GDAL GMT -> netCDF4 GRD -> GeoTIFF fallback."""
         lons_cut, lats_cut, gt_orig, proj = geo_info
-        new_gt = list(gt_orig)
-        new_gt[0] = lons_cut[0]
-        new_gt[3] = lats_cut[0]
-        
+        gt = list(gt_orig)
+        gt[0], gt[3] = lons_cut[0], lats_cut[0]
         rows, cols = data.shape
-        mem_driver = gdal.GetDriverByName('MEM')
-        mem_ds = mem_driver.Create('', cols, rows, 1, gdal.GDT_Float32)
-        mem_ds.SetGeoTransform(new_gt)
-        mem_ds.SetProjection(proj)
-        mem_ds.GetRasterBand(1).WriteArray(data)
-        mem_ds.GetRasterBand(1).SetNoDataValue(np.nan)
-        
-        driver_name = 'GMT'
-        driver = gdal.GetDriverByName(driver_name)
-        
+
+        # Prepare GDAL in-memory raster for GMT / GTiff output.
+        mem = gdal.GetDriverByName('MEM').Create('', cols, rows, 1, gdal.GDT_Float32)
+        mem.SetGeoTransform(gt)
+        mem.SetProjection(proj)
+        band = mem.GetRasterBand(1)
+        band.WriteArray(data)
+        band.SetNoDataValue(np.nan)
+
+        # 1. Legacy GDAL GMT raster driver.
+        driver = gdal.GetDriverByName('GMT')
+        if driver is not None:
+            out_path = os.path.join(result_dir, out_name)
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            dst = driver.CreateCopy(out_path, mem, 0)
+            if dst is not None:
+                dst = mem = None
+                aux = out_path + '.aux.xml'
+                if os.path.exists(aux):
+                    try:
+                        os.remove(aux)
+                    except OSError:
+                        pass
+                print(f"    -> Saved GRD (GDAL GMT): {out_name}")
+                return
+
+        # 2. Modern GMT-compatible netCDF GRD.
+        try:
+            from netCDF4 import Dataset
+
+            root, ext = os.path.splitext(out_name)
+            if ext.lower() != '.grd':
+                out_name = root + '.grd'
+            out_path = os.path.join(result_dir, out_name)
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+            x = gt[0] + (np.arange(cols) + 0.5) * gt[1] + 0.5 * gt[2]
+            y = gt[3] + 0.5 * gt[4] + (np.arange(rows) + 0.5) * gt[5]
+
+            with Dataset(out_path, 'w', format='NETCDF4_CLASSIC') as nc:
+                nc.createDimension('lat', rows)
+                nc.createDimension('lon', cols)
+
+                lon = nc.createVariable('lon', 'f8', ('lon',))
+                lat = nc.createVariable('lat', 'f8', ('lat',))
+                z = nc.createVariable(
+                    'z', 'f4', ('lat', 'lon'),
+                    fill_value=np.float32(np.nan)
+                )
+
+                lon[:] = x
+                lat[:] = y
+                z[:] = np.asarray(data, dtype=np.float32)
+
+                lon.units, lon.standard_name = 'degrees_east', 'longitude'
+                lat.units, lat.standard_name = 'degrees_north', 'latitude'
+                nc.Conventions = 'COARDS, CF-1.7'
+                nc.node_offset = 1
+                if proj:
+                    nc.projection_wkt = proj
+
+            mem = None
+            print(f"    -> Saved GRD (netCDF4): {out_name}")
+            return
+
+        except Exception as e:
+            print(f"    [!] GRD output unavailable ({e}); falling back to GeoTIFF.")
+
+        # 3. Final fallback: GeoTIFF.
+        driver = gdal.GetDriverByName('GTiff')
         if driver is None:
-            print(f"    [!] Warning: GDAL '{driver_name}' driver not found in this environment. Falling back to 'GTiff'.")
-            driver_name = 'GTiff'
-            driver = gdal.GetDriverByName(driver_name)
-            out_name = out_name.replace('.grd', '.tif') 
-            if out_name.endswith('.grd'):
-                out_name = out_name[:-4] + '.tif'
-            
-        if driver is None:
-            mem_ds = None
-            raise RuntimeError("Critical: Neither GMT nor GTiff GDAL drivers are available.")
+            mem = None
+            raise RuntimeError("Critical: GMT, netCDF4 and GTiff outputs are unavailable.")
+
+        root, ext = os.path.splitext(out_name)
+        out_name = root + '.tif' if ext.lower() == '.grd' else out_name
+        if not out_name.lower().endswith(('.tif', '.tiff')):
+            out_name += '.tif'
 
         out_path = os.path.join(result_dir, out_name)
-        if os.path.exists(out_path): os.remove(out_path)
-        
-        dst_ds = driver.CreateCopy(out_path, mem_ds, 0)
-    
-        mem_ds = None
-        dst_ds = None 
-        
-        # Cleanup XML
-        aux_xml = out_path + ".aux.xml"
-        if os.path.exists(aux_xml):
-            try: os.remove(aux_xml)
-            except OSError: pass
+        if os.path.exists(out_path):
+            os.remove(out_path)
 
-        fmt_label = "GRD" if driver_name == 'GMT' else "TIF"
-        print(f"    -> Saved {fmt_label}: {out_name}")
+        dst = driver.CreateCopy(out_path, mem, 0)
+        mem = dst = None
+        if dst is False:
+            raise RuntimeError(f"Failed to create GeoTIFF: {out_path}")
+
+        aux = out_path + '.aux.xml'
+        if os.path.exists(aux):
+            try:
+                os.remove(aux)
+            except OSError:
+                pass
+
+        print(f"    -> Saved TIF: {out_name}")
 
     def _get_robust_clim(self, data, symmetric=True):
         """get xlim/ylim for plot"""
